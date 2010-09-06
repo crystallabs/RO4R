@@ -7,6 +7,7 @@ Contents:
 2. How to see it work
 3. Benchmarks
 4. Programming notes
+5. TODO
 
 
 Supported Ruby versions:
@@ -103,8 +104,8 @@ Programming notes:
     your Ruby app, on the server side (the one that exports the object).
     (The rmarshal.c is currently a version working with Ruby 1.8).
 
-		Do that and the clients will transparently be able to use the remote
-		object even though they don't know its Class.
+    Do that and the clients will transparently be able to use the remote
+    object even though they don't know its Class.
 
   Method return values:
 
@@ -120,4 +121,10 @@ Programming notes:
 
     RO4R has been in production use with Ruby 1.9 and the standard Ruby
     marshaller since 2007.
+
+
+TODO:
+
+ - rmarshall for Ruby 1.9
+ - more examples from our production use
 
