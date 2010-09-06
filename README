@@ -12,7 +12,7 @@ Contents:
 Supported Ruby versions:
 
     Supports Ruby 1.8.x and 1.9.x out of the box in any combination of
-		client and server versions.
+    client and server versions.
 
 
 How to see it work:
@@ -101,7 +101,7 @@ Programming notes:
     Included in the distribution is rmarshal/, a modification of
     Ruby marshaller that can you need to compile and 'require' into
     your Ruby app, on the server side (the one that exports the object).
-		(The rmarshal.c is currently a version working with Ruby 1.8).
+    (The rmarshal.c is currently a version working with Ruby 1.8).
 
   Method return values:
 
