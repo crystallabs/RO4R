@@ -11,8 +11,8 @@ Contents:
 
 Supported Ruby versions:
 
-    Supports 1.8.x and 1.9.x out of the box in any combination of client
-    and server versions.
+    Supports Ruby 1.8.x and 1.9.x out of the box in any combination of
+		client and server versions.
 
 
 How to see it work:
@@ -25,9 +25,8 @@ How to see it work:
   - In one terminal, start an example server (it exports one Ruby Hash
     variable and provides main loop):
 
-    git clone git://github.com/docelic/RO4R.git
     cd RO4R
-    ruby examples/srv.rb
+    ruby -I. examples/srv.rb
 
 
   - In another terminal, start an example client (it attaches to the
@@ -35,7 +34,7 @@ How to see it work:
     benchmark statistics and the contents of the Hash):
 
     cd RO4R
-    ruby examples/cli.rb
+    ruby -I. examples/cli.rb
    
     1.200000   0.230000   1.430000 (  2.522289)
     {:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
@@ -53,12 +52,12 @@ How to see it work:
       #<NoMethodError: undefined method `length' for nil:NilClass>)
 
 
- - You can open another terminal and run the example client under irb,
+ - You can open another terminal and run the example client under irb -r,
    which will do its thing and leave you with an IRB shell, from which
    you can query and modify $r yourself:
 
    cd RO4R
-   irb -r examples/cli.rb
+   irb -I. -r examples/cli.rb
    > $r[:counter]
    9999
    > $r[:test_value]= 717
@@ -75,7 +74,7 @@ How to see it work:
    so far:
 
    cd RO4R
-   irb -r examples/cli.rb
+   irb -I. -r examples/cli.rb
    > $r
    {:counter=>9999, 1=>A, 2=>#<A:0xb7745e34>, :test_value=>717}
 
