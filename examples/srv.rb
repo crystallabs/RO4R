@@ -1,3 +1,7 @@
+#!/usr/bin/env ruby
+
+require 'RO4R'
+
 $r= {}
 
 class A
@@ -8,4 +12,6 @@ $r[1]= A
 $r[2]= A.new
 
 $s= RO4R::Server.new $r
+
+$s.join
 
