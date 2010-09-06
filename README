@@ -113,4 +113,8 @@ Programming notes:
     if the (unnecessary) return value would be a weird object that Ruby
     marshaller can't serialize and pass back to the client.
 
+  Code stability:
+
+    RO4R has been in production use with Ruby 1.9 and the standard Ruby
+    marshaller since 2007.
 
