@@ -37,7 +37,7 @@ How to see it work:
     cd RO4R
     ruby -I. examples/cli.rb
    
-    1.200000   0.230000   1.430000 (  2.522289)
+    0.390000   0.390000   0.780000 (  1.451144)
     {:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
 
     First line is the benchmark output, showing user, system, total
