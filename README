@@ -1,13 +1,18 @@
 
 RO4R - Remote Objects for Ruby
 
+Contents:
+
+1. Supported Ruby Versions
+2. How to see it work
+3. Benchmarks
+4. Programming notes
 
 
 Supported Ruby versions:
 
     Supports 1.8.x and 1.9.x out of the box in any combination of client
     and server versions.
-
 
 
 How to see it work:
@@ -75,7 +80,6 @@ How to see it work:
    {:counter=>9999, 1=>A, 2=>#<A:0xb7745e34>, :test_value=>717}
 
 
-
 Benchmarks (10,000 RPC invocations):
 
   Server   Client     Stats
@@ -83,7 +87,6 @@ Benchmarks (10,000 RPC invocations):
    1.9.2     1.8.7     1.000000   0.280000   1.280000 (  2.009202)
    1.8.7     1.9.2     0.520000   0.300000   0.820000 (  1.914454)
    1.8.7     1.8.7     0.960000   0.260000   1.220000 (  2.472942)
-
 
 
 Programming notes:
@@ -110,3 +113,5 @@ Programming notes:
     value is not needed. This is cleaner and can also save you trouble
     if the (unnecessary) return value would be a weird object that Ruby
     marshaller can't serialize and pass back to the client.
+
+
