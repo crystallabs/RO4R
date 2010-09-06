@@ -99,9 +99,12 @@ Programming notes:
     about.
 
     Included in the distribution is rmarshal/, a modification of
-    Ruby marshaller that can you need to compile and 'require' into
+    Ruby marshaller that you need to compile and 'require' into
     your Ruby app, on the server side (the one that exports the object).
     (The rmarshal.c is currently a version working with Ruby 1.8).
+
+		Do that and the clients will transparently be able to use the remote
+		object even though they don't know its Class.
 
   Method return values:
 
@@ -109,7 +112,7 @@ Programming notes:
     values because Ruby simply discards them. On methods that will be
     invoked remotely, RO4R will pass the return value back to the client,
     so pay attention to exit a method with an explicit 'nil' if its return
-    value is not needed. This is cleaner and can also save you trouble
+    value is not needed. This is cleaner and can also save you from errors
     if the (unnecessary) return value would be a weird object that Ruby
     marshaller can't serialize and pass back to the client.
 
