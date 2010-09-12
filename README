@@ -31,7 +31,7 @@ How to see it work:
 
 
   - In another terminal, start an example client (it attaches to the
-    shared Hash, iterates a counter 1000 times, and then prints the
+    shared Hash, iterates a counter 10000 times, and then prints the
     benchmark statistics and the contents of the Hash):
 
     cd RO4R
