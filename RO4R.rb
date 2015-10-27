@@ -88,6 +88,9 @@ module RO4R
 		def __remote_id
 			@id
 		end
+		def _dump *arg
+			super
+		end
 		private
 		def method_missing name, *args, &block
 			if name.to_s[0..0]== '_' # keep 'underscore calls' local
