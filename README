@@ -1,5 +1,5 @@
 
-RO4R - Remote Objects for Ruby 1.0
+RO4R 1.0 - Remote Objects for Ruby (1.8, 1.9, 2.x+)
 
 Contents:
 
@@ -12,8 +12,8 @@ Contents:
 
 Supported Ruby versions:
 
-    Supports Ruby 1.8.x and 1.9.x out of the box in any combination of
-    client and server versions.
+    Supports all Ruby versions from 1.8 above out of the box, in any
+    combination of client and server versions.
 
 
 How to see it work:
@@ -125,6 +125,6 @@ Programming notes:
 
 TODO:
 
- - rmarshall for Ruby 1.9
+ - rmarshall for Ruby 1.9, 2.x
  - more examples from our production use
 
