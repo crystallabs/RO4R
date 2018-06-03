@@ -35,7 +35,7 @@ NOTE: when the client program does its job and disconnects, on the server
 side you will see the following message which you can safely ignore:
 
 ```
-      #<NoMethodError: undefined method `length' for nil:NilClass>)
+#<NoMethodError: undefined method `length' for nil:NilClass>)
 ```
 
 ### Benchmarks explanation
@@ -43,8 +43,8 @@ side you will see the following message which you can safely ignore:
 When you run the above, it will print statistics such as:
 
 ```
-    0.390000   0.390000   0.780000 (  1.451144)
-    {:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
+0.390000   0.390000   0.780000 (  1.451144)
+{:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
 ```
 
 The first line is the benchmark output, showing user, system, total
