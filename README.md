@@ -14,23 +14,23 @@ For support on older versions, please see below under "Other Ruby versions".
   git clone git://github.com/docelic/RO4R.git
 
 
-- In one terminal, start an example server (it exports one Ruby Hash
-  variable and provides main loop):
+- In one terminal, start an example server. It will listen on port 4044,
+  export one Ruby Hash variable, and provide the main loop:
 
   cd RO4R
   ruby -I. examples/srv.rb
 
 
-- In another terminal, start an example client (it attaches to the
-  shared Hash, iterates a counter 10000 times, and then prints the
-  benchmark statistics and the contents of the Hash):
+- In another terminal, start an example client. It will attach to the
+  server and shared Hash, iterate a counter 10_000 times, and then print
+  the benchmark statistics and the final contents of the Hash:
 
   cd RO4R
   ruby -I. examples/cli.rb
 ```
 
 NOTE: when the client program does its job and disconnects, on the server
-side you will see a message you can ignore:
+side you will see the following message which you can safely ignore:
 
 ```
       #<NoMethodError: undefined method `length' for nil:NilClass>)
@@ -49,15 +49,15 @@ The first line is the benchmark output, showing user, system, total
 and real times. (That's benchmark for the 10,000 iterations that
 the example client does).
 
-Second line are the contents of the shared Hash object. In it you see
+The second line are the contents of the shared Hash object. In it you see
 the :counter that was created on the client side, and two keys that
 were initialized by the example server.
 
 ### Modifying/querying shared object
 
-You can open another terminal and run the example client under `irb -r`,
-which will do its thing and leave you with an IRB shell, from which
-you can query and modify $r yourself:
+You can open another terminal and run the example client under `irb -r`.
+It would do the same as above, but it would also leave you with an IRB shell
+from which you can further query or modify `$r` yourself:
 
 ```
 $ cd RO4R
