@@ -1,4 +1,4 @@
-# RO4R 2.0 - Remote Objects for Ruby 2.4+
+# RO4R - Remote Objects for Ruby 2.4+
 
 ## Supported Ruby versions
 
@@ -116,17 +116,21 @@ But it is also possible to share objects that clients know nothing about.
 
 Included in the distribution is rmarshal/, a modification of
 Ruby marshaller that you need to compile and 'require' into
-your Ruby app on the server side (the one that exports the object).
-(The rmarshal.c is currently out of date, and the version included works with Ruby 1.8).
+your Ruby app on the server side (the one that exports the object),
+without any other changes.
 
-Do that and the clients will transparently be able to use the remote
+With that, the clients will transparently be able to use the remote
 object even though they don't know its Class.
+
+NOTE: rmarshal.c is currently out of date, and the version included works with Ruby 1.8.
 
 ### Method return values
 
 When writing methods, you usually don't care about unused return
-values because Ruby simply discards them. On methods that will be
-invoked remotely, RO4R will pass the return value back to the client,
+values because Ruby simply discards them.
+
+However, on methods that are invoked remotely, RO4R will pass the return
+value back to the client,
 so pay attention to exit a method with an explicit 'nil' if its return
 value is not needed. This is cleaner and can also save you from errors
 if the (unnecessary) return value would be a weird object that Ruby
