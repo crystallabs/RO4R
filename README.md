@@ -11,22 +11,22 @@ For support on older versions, please see below under "Other Ruby versions".
 ```
 - Check out the files:
 
-	git clone git://github.com/docelic/RO4R.git
+  git clone git://github.com/docelic/RO4R.git
 
 
 - In one terminal, start an example server (it exports one Ruby Hash
-	variable and provides main loop):
+  variable and provides main loop):
 
-	cd RO4R
-	ruby -I. examples/srv.rb
+  cd RO4R
+  ruby -I. examples/srv.rb
 
 
 - In another terminal, start an example client (it attaches to the
-	shared Hash, iterates a counter 10000 times, and then prints the
-	benchmark statistics and the contents of the Hash):
+  shared Hash, iterates a counter 10000 times, and then prints the
+  benchmark statistics and the contents of the Hash):
 
-	cd RO4R
-	ruby -I. examples/cli.rb
+  cd RO4R
+  ruby -I. examples/cli.rb
 ```
 
 NOTE: when the client program does its job and disconnects, on the server
