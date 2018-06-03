@@ -13,7 +13,7 @@ For support on older versions, please see below under "Other Ruby versions".
 ```
 - Check out the files:
 
-  git clone git://github.com/docelic/RO4R.git
+  git clone git://github.com/crystallabs/RO4R.git
 
 
 - In one terminal, start an example server. It will listen on port 4044,
