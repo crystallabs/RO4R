@@ -144,7 +144,7 @@ end
 module RO4R
 	### Connection to a remote machine (server or client) ###
 	class Connection
-		def initialize host='localhost', object= nil, safe= 3
+		def initialize host='localhost', object= nil, safe= 1
 			@safe= safe.to_i
 			@send_mutex= Mutex.new
 			@recv_mutex= Mutex.new
@@ -381,9 +381,9 @@ module RO4R
 			#puts "#{label}: #{1e3*(Time.now-tm)} ms => #{res||ret}"
 		end
 
-		def read io, len # intended to be redefined if necessary 
+		def read io, len # intended to be redefined if necessary
 			@io.read len
-		end 
+		end
 
 		def listen
 			Thread.current[:__conn]= self
@@ -606,7 +606,7 @@ module RO4R
 		DefaultAddress= '0.0.0.0'
 		attr_reader :connections
 
-		def initialize object= Hash.new, port= DefaultPort, safe= 3
+		def initialize object= Hash.new, port= DefaultPort, safe= 1
 			### root object must be passed by ref:
 			raise ArgumentError, "#{object} must be sent by reference" unless object.__by_ref?
 			server= case port
@@ -630,10 +630,10 @@ module RO4R
 
 	# Classes # to be passed by value (serialized):
 	[ Array,
-		Bignum,
 		#Complex,
+		#Bignum, Fixnum,
 		Exception,
-		FalseClass, Fixnum, Float,
+		FalseClass, Float,
 		Integer,
 		MatchData,
 		NilClass,	Numeric,
