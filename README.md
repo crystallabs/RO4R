@@ -1,4 +1,4 @@
-# RO4R 1.0 - Remote Objects for Ruby 2.4+
+# RO4R 2.0 - Remote Objects for Ruby 2.4+
 
 ## Supported Ruby versions
 
