@@ -6,6 +6,7 @@ require 'RO4R'
 $c= RO4R::Connection.new( ARGV.first || 'localhost')
 $r= $c.root
 
-puts Benchmark.measure { 10000.times do |n| $r[:counter]=n end}
+$r[:counter]||= 1
+puts Benchmark.measure { 10000.times do |n| $r[:counter]+=1 end}
 
 puts $r.inspect
