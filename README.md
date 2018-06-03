@@ -91,11 +91,11 @@ Benchmarks for 10,000 RPC invocations:
 
 ```
 Date        Server   Client     Stats
-Oct 2015:   2.6.0p2   2.6.0p2   0.192000   0.100000   0.292000 (  0.517264)
-Jun 2016:   2.2.3     2.2.3     0.196000   0.076000   0.272000 (  0.481286)
+Jun 2018:   2.6.0p2   2.6.0p2   0.192000   0.100000   0.292000 (  0.517264)
+Oct 2015:   2.2.3     2.2.3     0.196000   0.076000   0.272000 (  0.481286)
 
-Oct 2015 setup: i7-4790K CPU @ 4.00GHz on Linux 4.2.0-040200-lowlatency
-Jun 2018 setup: i7-4790K CPU @ 4.00GHz on Linux 3.16.0-4-amd64
+Jun 2018 setup was: i7-4790K CPU @ 4.00GHz on Linux 3.16.0-4-amd64
+Oct 2015 setup was: i7-4790K CPU @ 4.00GHz on Linux 4.2.0-040200-lowlatency
 
 Older Benchmarks from 2008:
 
