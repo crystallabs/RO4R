@@ -1,3 +1,5 @@
+**Project status**: `[ ] Being developed  [X] Usable  [X] Functionally complete`
+
 # RO4R - Remote Objects for Ruby 2.4+
 
 ## Supported Ruby versions
