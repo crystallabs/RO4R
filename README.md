@@ -1,5 +1,3 @@
-**Project status**: `[ ] Being developed  [X] Usable  [X] Functionally complete`
-
 # RO4R - Remote Objects for Ruby 2.4+
 
 ## Supported Ruby versions
@@ -10,29 +8,27 @@ For support on older versions, please see below under "Other Ruby versions".
 
 ## How to see it work
 
+1. Check out the files:
+
 ```
-- Check out the files:
-
   git clone git://github.com/crystallabs/RO4R.git
+```
 
+1. In one terminal, start an example server. It will listen on port 4044, export one Ruby Hash variable, and provide the main loop:
 
-- In one terminal, start an example server. It will listen on port 4044,
-  export one Ruby Hash variable, and provide the main loop:
-
+```
   cd RO4R
   ruby -I. examples/srv.rb
+```
 
+1. In another terminal, start an example client. It will attach to the server and shared Hash, iterate a counter 10_000 times, and then print the benchmark statistics and the final contents of the Hash:
 
-- In another terminal, start an example client. It will attach to the
-  server and shared Hash, iterate a counter 10_000 times, and then print
-  the benchmark statistics and the final contents of the Hash:
-
+```
   cd RO4R
   ruby -I. examples/cli.rb
 ```
 
-NOTE: when the client program does its job and disconnects, on the server
-side you will see the following message which you can safely ignore:
+NOTE: when the client program does its job and disconnects, on the server side you will see the following message which you can safely ignore:
 
 ```
 #<NoMethodError: undefined method `length' for nil:NilClass>)
@@ -47,37 +43,40 @@ When you run the above, it will print statistics such as:
 {:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
 ```
 
-The first line is the benchmark output, showing user, system, total
-and real times. (That's benchmark for the 10,000 iterations that
-the example client does).
+The first line is the benchmark output, showing user, system, total and real times. (That's benchmark for the 10,000 iterations that the example client does).
 
-The second line are the contents of the shared Hash object. In it you see
-the :counter that was created on the client side, and two keys that
-were initialized by the example server.
+The second line are the contents of the shared Hash object. In it you see the :counter that was created on the client side, and two keys that were initialized by the example server.
 
-### Modifying/querying shared object
+### Testing
 
-You can open another terminal and run the example client under `irb -r`.
-It would do the same as above, but it would also leave you with an IRB shell
-from which you can further query or modify `$r` yourself:
+To test RO4R, you can create two processes (client and server), and then display and modify variables and invoke remote functions.
+
+1. To conveniently test modifying data, run the basic benchmark under IRB, then modify some hash keys on the example shared object `$r`:
 
 ```
 $ cd RO4R
 $ irb -I. -r examples/cli.rb
 
+# ... statistics will be printed ...
+
 > $r[:counter]
 9999
 > $r[:test_value]= 717
 #-> 717
+```
 
-# On the server side, we've initialized an example method 'm' that returns
-# value of 1, and that you can run and test:
+1. To run defined functions, simply call them:
 
+On the server side, in the example we have initialized an example method 'm' that returns value of 1; you can run it:
+
+```
 > $r[2].m
 #-> 1
 ```
-And you can also open a new terminal in which you can query all we've done
-so far, since the object persists in the process:
+
+1. Multiple clients:
+
+You can also open a new/third terminal in which you can query all the changes:
 
 ```
 $ cd RO4R
@@ -148,8 +147,8 @@ For use with lower versions (Ruby 1.8 to Ruby 2.3) , please either use RO4R rele
 or edit RO4R.rb to replace "safe= 1" with "safe= 3" and uncomment the line saying
 "Bignum, Fixnum".
 
-I believe the C marshaller is operational only for Ruby 1.8 versions.
+The C marshaller (rmarshall) is operational only for Ruby 1.8 versions.
 
 ## TODO
 
-* Add rmarshall for latest Ruby
+* Add rmarshall for newer Ruby versions
