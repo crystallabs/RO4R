@@ -1,5 +1,7 @@
 # RO4R - Remote Objects for Ruby 2.4+
 
+RO4R - clone of our Ruby RPC library that has been in production use since 2007.
+
 ## Supported Ruby versions
 
 Supports all Ruby versions from 2.4 above, in all combinations of client and server versions.
