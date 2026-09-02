@@ -199,12 +199,13 @@ module RO4R
 				@io= host
 			end
 			@local[ nil.__id__]= @local[ @object.__id__]= @object
-			@pool= [] # thread pool for executing remote calls
-			@poolsize= 5 # how many threads to keep idle
+			@pool= [] # mailboxes (Queues) of idle worker threads for remote calls
+			@poolsize= 5 # how many idle workers to keep
+			@release_q= Queue.new # ids of collected RemoteObjects, to release remotely
 			@thread= Thread.new do
 				listen # Wait for incoming messages
-				#$stderr.puts "listen thread exited"
 			end
+			@release_thread= Thread.new{ release_loop }
 			@root= RemoteObject.new nil.__id__, self # remote object exported to us
 		end
 		attr_reader :object, :root, :thread, :poolsize
@@ -237,14 +238,19 @@ module RO4R
 			ro
 		end
 		def make_finalizer id
-			# tell the peer that we no longer hold a reference to its object
-			proc{ |lid| Thread.new {
-				begin
-					send Release.new( id)
-				rescue
-					# ignore, since the RemoteObject is already gone, anyway.
-				end
-			} }
+			# Finalizers may run on any thread, including one that holds
+			# @send_mutex, so they must not send directly; queue the id for
+			# release_loop instead.
+			q= @release_q
+			proc{ |lid| q.push id rescue nil } # ClosedQueueError once disconnected
+		end
+		# Tell the peer that we no longer hold references to its objects.
+		def release_loop
+			while ( id= @release_q.pop)
+				send Release.new( id)
+			end
+		rescue ConnectionError, ClosedQueueError
+			# peer gone; nothing more to release
 		end
 		def local_reference object
 			# this ref will be handed over, local object must not disappear
@@ -344,60 +350,64 @@ module RO4R
 				end
 			end
 		end
+		# Hand an incoming Call to an idle worker thread, or a new one. Workers
+		# are unbounded on purpose: a remote call may call back into the peer,
+		# which may call us again while the first call is still running.
 		def local_call message
-			#$stderr.puts "Received local call: #{message.class} : #{message.nme}"
-			# TODO: optionally disable RefCalls for security reasons
-			lct= nil
-			@recv_mutex.synchronize{ lct= @pool.pop}
-			lct||= Thread.new do
-				while true
-					Thread.stop
+			mbox= @recv_mutex.synchronize{ @pool.pop}
+			mbox||= spawn_worker
+			mbox.push message
+		end
+		# A worker executes calls handed to it through its own Queue. When done
+		# it returns to the idle pool, or exits if the pool is full or the
+		# connection is closed.
+		def spawn_worker
+			mbox= Queue.new
+			Thread.new do
+				while ( msg= mbox.pop)
 					begin
-						t= Thread.current
-						msg= t[ :msg]
-						if @local.has_key? msg.oid
-							obj= @local[ msg.oid]
-							#$stderr.puts "... upon a #{obj.class}"
-							if obj.__nil?
-								raise TypeError, "No root object exported"
-							end
-						else
-							raise TypeError, "Receiver ##{msg.oid} not found"
-						end
-						#GC.disable
-						if msg.nme
-							if msg.nme.to_s[0..0]=='_'
-								raise NoMethodError, "Call forbidden"
-							end
-							arg= msg.arg
-							blk= if msg.blk
-								blk= proc { | *arg| remote_yield msg.tid, arg}
-							else nil
-							end
-							### TODO: check if the method is public (or just wait for Ruby 2)
-							r= obj.__remote_call msg.nme, arg, blk
-						else
-							r= obj
-						end
-						#GC.enable
-						# Explicit conversion here so that return-by-ref call can be
-						#	honored ( but ingnore byref request for nil )
-						forceref= msg.kind_of?( RefCall) && !r.__nil?
-						ref= make_reference r, forceref
-						send Return.new( msg.tid, ref, false)
-					rescue Exception=> e
-						RO4R.logger.debug do
-							"error in remote call '#{msg.nme}': #{e.class}: #{e.message}\n" +
-								Array( e.backtrace).join( "\n")
-						end
-						send_error msg.tid, e
+						handle_call msg
+					rescue ConnectionError
+						break # peer gone, nothing to reply to
 					end
-					if @pool.size< @poolsize then @pool.push t else Thread.exit end
+					keep= @recv_mutex.synchronize do
+						!@closed && @pool.size< @poolsize && @pool.push( mbox)
+					end
+					break unless keep
 				end
 			end
-			Thread.pass until lct.stop?
-			lct[ :msg]= message
-			lct.run if lct.alive?
+			mbox
+		end
+		def handle_call msg
+			if @local.has_key? msg.oid
+				obj= @local[ msg.oid]
+				if obj.__nil?
+					raise TypeError, "No root object exported"
+				end
+			else
+				raise TypeError, "Receiver ##{msg.oid} not found"
+			end
+			if msg.nme
+				if msg.nme.to_s[0..0]=='_'
+					raise NoMethodError, "Call forbidden"
+				end
+				blk= if msg.blk
+					proc { | *arg| remote_yield msg.tid, arg}
+				end
+				r= obj.__remote_call msg.nme, msg.arg, blk
+			else
+				r= obj
+			end
+			# Explicit conversion here so that return-by-ref call can be
+			# honored (but ignore byref request for nil)
+			forceref= msg.kind_of?( RefCall) && !r.__nil?
+			send Return.new( msg.tid, make_reference( r, forceref), false)
+		rescue Exception=> e
+			RO4R.logger.debug do
+				"error in remote call '#{msg.nme}': #{e.class}: #{e.message}\n" +
+					Array( e.backtrace).join( "\n")
+			end
+			send_error msg.tid, e
 		end
 
 		# Return an exception to the caller. If it cannot be marshalled (e.g. it
@@ -511,6 +521,10 @@ module RO4R
 				end
 				@remote= ObjectSpace::WeakMap.new # useless after the connection is broken
 				@local.clear # free local objects
+				# stop the helper threads
+				@closed= true
+				@release_q.close
+				@recv_mutex.synchronize{ @pool.each( &:close); @pool.clear}
 				@on_close.call self if @on_close
 			end
 		end

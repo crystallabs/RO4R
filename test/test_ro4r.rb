@@ -144,6 +144,25 @@ class TestRO4R< Minitest::Test
 		RO4R.logger= old
 	end
 
+	def test_nested_call_from_within_a_block
+		# The block runs on the client while the server is still inside
+		# each_twice, and calls the server again from there.
+		seen= []
+		@r.each_twice{ |x| seen<< @r.echo( x* 10)}
+		assert_equal [10, 20], seen
+	end
+
+	def test_close_leaves_no_helper_threads
+		10.times{ @r.obj } # exercise workers and the release path
+		ro4r_threads= lambda do
+			Thread.list.select{ |t| t!= Thread.current and
+				Array( t.backtrace).any?{ |l| l.include? 'RO4R.rb'} }
+		end
+		refute_empty ro4r_threads.call
+		@server.close
+		wait_until{ ro4r_threads.call.empty?}
+	end
+
 	def test_reference_ids_are_64_bit
 		conn= Object.new
 		def conn.make_object( ref) ref end

@@ -154,6 +154,15 @@ waits for their handler threads to finish. `RO4R::Connection#close` disconnects
 a single client. Calls made on a connection whose peer has gone away raise
 `RO4R::ConnectionError` (a `RuntimeError`, message "Unable to reach peer").
 
+### Concurrency
+
+Each incoming call is executed on a worker thread belonging to the connection,
+so exported methods must be thread-safe if clients may call them concurrently.
+Workers are created on demand and up to five idle ones are kept per
+connection (`Connection#poolsize`). There is deliberately no upper bound: a
+remote method may call back into the client, which may call the server again
+before the first call has returned.
+
 ### Logging
 
 By default RO4R prints only warnings and errors to `$stderr`. Exceptions raised
