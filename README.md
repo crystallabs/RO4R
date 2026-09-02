@@ -30,7 +30,10 @@ It is **not** safe to expose to untrusted peers:
 ## Wire format
 
 Each message is a 32-bit little-endian length prefix followed by the marshalled
-payload; object ids inside references are 64-bit signed little-endian.
+payload; object ids inside references are 64-bit signed little-endian. Sockets
+are set to `TCP_NODELAY`. `Connection#read(io, maxlen)` is the single point
+through which bytes enter and may be overridden; it must return between 1 and
+`maxlen` bytes or raise `EOFError`.
 
 **This is incompatible with releases before the Ruby 4.0 update**, which used
 native-endian 32-bit object ids: both peers must run the same generation of RO4R.
@@ -191,6 +194,15 @@ With that, the clients will transparently be able to use the remote
 object even though they don't know its Class.
 
 NOTE: rmarshal.c is currently out of date, and the version included works with Ruby 1.8.
+
+### Marshal and by-value classes
+
+RO4R works by hooking `Marshal`: while it serializes a message, objects that are
+passed by reference answer `respond_to?(:_dump)` with true and dump themselves
+as a reference. The hook is active only on the thread and for the duration of
+RO4R's own `Marshal.dump`, so other uses of `Marshal` in the same process are
+not affected. Classes passed by value keep their own `_dump`/`_load` if they
+define one (e.g. `Time`).
 
 ### Method return values
 

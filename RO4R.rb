@@ -33,31 +33,45 @@ class Object
 		MARSHAL.load str
 	end
 	alias_method :__respond_to?, :respond_to?
+	# Marshal asks respond_to?(:_dump) for every object it dumps; answering
+	# true for by-reference objects makes it call our _dump below, which
+	# replaces the object with a reference. This only happens while RO4R
+	# itself is marshalling (Thread.current[:__ro4r_marshal] is set), so other
+	# users of Marshal in the process are unaffected. Otherwise, and for
+	# by-value objects, a class's own _dump (e.g. Time's) is honoured.
+	#
 	# Defined in a prepended module rather than directly on Object, since Ruby
 	# warns about redefining Object#respond_to? (possible infinite loop). It is
 	# also prepended to by-value classes that define their own respond_to?
 	# (e.g. Exception), which would otherwise bypass this override.
 	module RespondTo
+		# class -> does it define _dump itself, rather than inherit ours?
+		CUSTOM_DUMP= Hash.new do |h, klass|
+			h[ klass]= klass.instance_method( :_dump).owner!= RespondTo
+		end
 		def respond_to? method, priv= false
-			if :_dump== method || :_dump_as== method ## cheat on Marshal.dump
-				 # use _dump if we have to turn the object into a reference
-				 # otherwise Marshal must do it on its own, possibly with the aid of
-				 # marshal_dump and marshal_load methods exposed by the object
-				__by_ref?
+			if :_dump== method
+				if Thread.current[:__ro4r_marshal] && __by_ref?
+					true
+				else
+					CUSTOM_DUMP[ __class]
+				end
+			elsif :_dump_as== method # RMarshal's hook, references only
+				Thread.current[:__ro4r_marshal] && __by_ref?
 			else
 				super
 			end
 		end
+		def _dump depth= -1
+			conn= Thread.current[:__conn]
+			MARSHAL.dump conn.make_reference( self, true), depth
+		end
+		def _dump_as
+			conn= Thread.current[:__conn]
+			conn.make_reference self, true
+		end
 	end
 	prepend RespondTo
-	def _dump depth= -1
-		conn= Thread.current[:__conn]
-		MARSHAL.dump conn.make_reference( self, true), depth
-	end
-	def _dump_as
-		conn= Thread.current[:__conn]
-		conn.make_reference self, true
-	end
 	def __remote_call method, arguments, block
 		m= method.to_sym
 		if __respond_to? m, false
@@ -198,6 +212,8 @@ module RO4R
 			else
 				@io= host
 			end
+			# request/response traffic: don't let Nagle hold back small writes
+			@io.setsockopt( :TCP, :NODELAY, 1) if @io.is_a?( TCPSocket)
 			@local[ nil.__id__]= @local[ @object.__id__]= @object
 			@pool= [] # mailboxes (Queues) of idle worker threads for remote calls
 			@poolsize= 5 # how many idle workers to keep
@@ -419,57 +435,30 @@ module RO4R
 			send Return.new( tid, RuntimeError.new( "#{e.class}: #{e.message}"), true)
 		end
 
-		def __time( label='', res=nil)
-			#tm= Time.now
-			ret= yield
-			#puts "#{label}: #{1e3*(Time.now-tm)} ms => #{res||ret}"
-			ret
+		# Read up to maxlen bytes, at least one; raise EOFError when the peer is
+		# gone. Intended to be redefined if necessary.
+		def read io, maxlen
+			io.readpartial maxlen
 		end
-
-		def read io, len # intended to be redefined if necessary
-			@io.read( len) or raise EOFError, "peer disconnected"
+		READ_CHUNK= 65536
+		# Return the payload of the next length-prefixed frame. `buf` holds bytes
+		# read ahead of the frame boundary and is reused across calls.
+		def read_frame buf
+			buf<< read( @io, READ_CHUNK) while buf.bytesize< 4
+			len= buf.unpack1( "L<")
+			buf<< read( @io, READ_CHUNK) while buf.bytesize< 4+ len
+			frame= buf.byteslice( 4, len)
+			buf[ 0, 4+ len]= ''
+			frame
 		end
 
 		def listen
 			Thread.current[:__conn]= self
 			@io.binmode
 			begin
-				len= data= msg= nil
+				buf= String.new( capacity: READ_CHUNK)
 				while true
-					#__time 'sel1', 'OK' {
-					#IO::select [@io], nil, nil
-					#}
-					#?! why does this cause a >50x slow-down? :
-					#__time 'read1' {
-					data= String.new
-					buflen= 4
-					while buflen> 0
-						aux= read @io, buflen
-						buflen-= aux.length
-						data<< aux
-					end
-					#GC.disable
-					len= data.unpack("L<").first
-					#GC.enable
-					#}
-					#__time 'sel2', 'OK' {
-					#IO::select [@io], nil, nil
-					#}
-					#__time 'read2' {
-					data= String.new
-					while len> 0
-						aux= read @io, len
-						len-= aux.length
-						data<< aux
-					end
-					#}
-					#__time 'load', 'OK' {
-					msg= MARSHAL.load data
-					#}
-					#msg= MARSHAL.load @io
-					###msg= MARSHAL.load( @io, proc{ |o|
-						###$stderr.print "#{o.__class}:"
-					###})
+					msg= MARSHAL.load read_frame( buf)
 					msg= Msg._load msg if msg.__kind_of? Array
 					#$stderr.puts "Recevied message #{msg.__class}" #unless msg.__kind_of? Msg
 					case msg
@@ -534,33 +523,24 @@ module RO4R
 			RO4R.logger.warn "sending a #{msg.__class} instead of a Msg" unless msg.__kind_of? Msg
 			t= Thread.current
 			t[:__conn]= self
-			#data= len= c= tm= nil
-			#__time 'dump' {
+			t[:__ro4r_marshal]= true
+			begin
 				data= MARSHAL.dump msg
-				len= data.size #bytesize
-			#}
-			#__time 'sync' {
+			ensure
+				t[:__ro4r_marshal]= nil
+			end
+			len= data.bytesize
 			@send_mutex.synchronize do
 				c=( t[:recv_cond]||= ConditionVariable.new)
-				#__time 'write' {
 				begin
-					@io.write [len].pack("L<") << data
+					@io.write [len].pack("L<"), data # one writev, no concatenation
 				rescue IOError, SystemCallError=> e
 					raise ConnectionError, "Unable to reach peer (#{e.message})"
 				end
-				#@io.write data
-				#}
-				#__time 'wait' {
 				if wait # wait for response
-					#t0= Time.now
 					c.wait @send_mutex while @receiver[ t.__id__]== t
-					#?! c.wait seems to occasionally return before cond. signal!
-					#td= Time.now- t0
-					#p td if td<2e-5
 				end
-				#}
 			end
-			#}
 		end
 	end
 

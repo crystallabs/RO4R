@@ -15,6 +15,16 @@ class Exported
 	def each_twice() yield 1; yield 2; :done end
 	def obj() Object.new end
 	def echo( x) x end
+	def epoch() Time.at( 0).utc end
+end
+# A by-value class with its own Marshal format.
+class Point
+	include ByVal
+	attr_reader :x, :y
+	def initialize( x, y) @x, @y= x, y end
+	def _dump( depth) [ @x, @y].pack( 'l<l<') end
+	def self._load( str) new( *str.unpack( 'l<l<')) end
+	def ==( o) o.is_a?( Point) && x== o.x && y== o.y end
 end
 class CustomError< StandardError; end
 
@@ -161,6 +171,20 @@ class TestRO4R< Minitest::Test
 		refute_empty ro4r_threads.call
 		@server.close
 		wait_until{ ro4r_threads.call.empty?}
+	end
+
+	def test_plain_marshal_is_unaffected_in_a_thread_that_made_calls
+		@r.ok
+		h= { a: 1, obj: Object.new, err: RuntimeError.new( "x")}
+		copy= Marshal.load( Marshal.dump( h))
+		assert_equal 1, copy[:a]
+		assert_instance_of Object, copy[:obj]
+		assert_equal "x", copy[:err].message
+	end
+
+	def test_by_value_objects_with_custom_dump
+		assert_equal Time.at( 0).utc, @r.epoch
+		assert_equal Point.new( 3, -4), @r.echo( Point.new( 3, -4))
 	end
 
 	def test_reference_ids_are_64_bit
