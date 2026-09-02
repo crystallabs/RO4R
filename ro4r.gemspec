@@ -12,11 +12,12 @@ Gem::Specification.new do |s|
 	s.homepage= 'https://github.com/crystallabs/RO4R'
 	s.license= 'AGPL-3.0-or-later' # see LICENSE
 	s.required_ruby_version= '>= 2.7'
-	s.files= Dir[ 'lib/**/*.rb'] + %w[ README.md LICENSE]
+	s.files= Dir[ 'lib/**/*.rb'] + %w[ README.md CHANGELOG.md LICENSE]
 	s.require_paths= [ 'lib']
 	s.metadata= {
 		'source_code_uri'=> s.homepage,
 		'bug_tracker_uri'=> "#{s.homepage}/issues",
+		'changelog_uri'=> "#{s.homepage}/blob/master/CHANGELOG.md",
 	}
 	s.add_development_dependency 'minitest', '~> 5.0'
 	s.add_development_dependency 'rake', '~> 13.0'

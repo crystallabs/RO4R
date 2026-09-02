@@ -1,0 +1,28 @@
+# Publishes the gem to rubygems.org when a v* tag is pushed, using RubyGems
+# trusted publishing (no API key): register this repository and workflow file
+# under the gem's "Trusted publishers" on rubygems.org first.
+name: Release
+
+on:
+  push:
+    tags: [ 'v*' ]
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+          bundler-cache: true
+      - name: Test
+        run: bundle exec rake test
+      - name: Check the tag matches the gem version
+        run: |
+          v=$(ruby -Ilib -r ro4r/version -e 'print RO4R::VERSION')
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != v$v"; exit 1; }
+      - uses: rubygems/release-gem@v1

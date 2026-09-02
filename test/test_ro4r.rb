@@ -1,6 +1,7 @@
 # Run with:  ruby -Ilib test/test_ro4r.rb  (or: rake test)
 require 'minitest/autorun'
 require 'socket'
+require 'rbconfig'
 require 'ro4r'
 
 # No RO4R thread may die with an unhandled exception; make that fail the run
@@ -25,6 +26,19 @@ class Exported
 	def kw( a:, b: 2) [ a, b] end
 	def mixed( x, *rest, k: nil, **opts) [ x, rest.size, k, opts.to_a] end
 	def sleep_for( s) sleep s; :woke end
+	# Yields once; records whether the method ran to completion or unwound.
+	def yield_once
+		$outcomes<< :yielding
+		r= yield 1
+		$outcomes<< [ :completed, r]
+		r
+	ensure
+		$outcomes<< :ensure
+	end
+	def slow_yield() sleep 0.3; yield 1; :done ensure $outcomes<< :ensure end
+	def bad_value() BadLoad.new end
+	def echo_yield( x) yield x end
+	def big( n) 'x'* n end
 	# Claims to respond to everything; must still not expose private methods.
 	def respond_to?( m, priv= false) true end
 	private
@@ -40,6 +54,12 @@ class Point
 	def ==( o) o.is_a?( Point) && x== o.x && y== o.y end
 end
 class CustomError< StandardError; end
+# A by-value class that the receiver cannot decode.
+class BadLoad
+	include ByVal
+	def _dump( depth) '' end
+	def self._load( str) raise "cannot load" end
+end
 
 class CapturingLogger
 	attr_reader :lines
@@ -51,6 +71,10 @@ end
 
 class TestRO4R< Minitest::Test
 	def setup
+		# decode failures are logged as warnings; keep the test output clean
+		@old_logger= RO4R.logger
+		RO4R.logger= CapturingLogger.new
+		$outcomes= Queue.new
 		@listener= TCPServer.new '127.0.0.1', 0
 		@port= @listener.addr[1]
 		@server= RO4R::Server.new Exported.new, @listener
@@ -59,9 +83,27 @@ class TestRO4R< Minitest::Test
 	end
 	def teardown
 		@server.close
+		@peer_conn.close if @peer_conn
+		if @peer
+			Process.kill 'TERM', @peer.pid
+			@peer.close
+		end
+		RO4R.logger= @old_logger
 	end
-	def connect
-		RO4R::Connection.new "127.0.0.1:#{@port}"
+	def connect **options
+		RO4R::Connection.new "127.0.0.1:#{@port}", **options
+	end
+	# A server in another process, which does not share our class table.
+	def connect_to_peer
+		@peer= IO.popen [ RbConfig.ruby, "-I#{File.expand_path( '../lib', __dir__)}",
+			File.join( __dir__, 'peer_server.rb')]
+		port= @peer.gets.to_i
+		@peer_conn= RO4R::Connection.new "127.0.0.1:#{port}"
+	end
+	def outcomes
+		list= []
+		list<< $outcomes.pop until $outcomes.empty?
+		list
 	end
 	def wait_until( timeout= 2)
 		t0= Time.now
@@ -158,7 +200,7 @@ class TestRO4R< Minitest::Test
 		assert_equal 2, o.__refs[0]
 		id= o.__remote_id
 		release= lambda do |n|
-			@conn.__send__ :send, RO4R::Release.new( id, n)
+			@conn.__send__ :transmit, RO4R::Release.new( id, n)
 			sleep 0.05
 		end
 		release.call 1 # one of the two references dropped: still exported
@@ -282,6 +324,9 @@ class TestRO4R< Minitest::Test
 		refute_empty ro4r_threads
 		@server.close
 		wait_until{ ro4r_threads.empty?}
+	rescue Minitest::Assertion
+		ro4r_threads.each{ |t| $stderr.puts "leftover #{t.inspect} #{t.status}", t.backtrace.first( 5) }
+		raise
 	end
 
 	def test_plain_marshal_is_unaffected_in_a_thread_that_made_calls
@@ -323,4 +368,237 @@ class TestRO4R< Minitest::Test
 	ensure
 		Thread.current[:__conn]= nil
 	end
+
+	### Blocks that exit early ###
+
+	def test_break_from_block_unwinds_the_server_method
+		assert_equal :broke, @r.yield_once{ break :broke }
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes # not :completed
+		wait_until{ ro4r_threads.none?{ |t| t.backtrace.any?{ |l| l.include? 'remote_yield'} } }
+		assert_equal 42, @r.ok
+	end
+
+	def test_throw_and_non_standard_errors_from_block_unwind_the_server_method
+		assert_equal :thrown, catch( :out) { @r.yield_once{ throw :out, :thrown } }
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes
+		assert_raises( Interrupt) { @r.yield_once{ raise Interrupt } }
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes
+		assert_equal 42, @r.ok
+	end
+
+	def test_standard_errors_from_block_are_raised_in_the_server_method
+		assert_raises( CustomError) { @r.yield_once{ raise CustomError, "in block" } }
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes # the method saw the error
+	end
+
+	def test_block_return_value_is_converted
+		o= @r.shared
+		assert_same o, @r.yield_once{ |x| o } # a RID goes back, an LID returns
+		assert_equal [ :yielding, [ :completed, Exported], :ensure], # the server got its own object
+			outcomes.map{ |x| x.is_a?( Array) ? [ x[0], x[1].__class] : x }
+		mine= Object.new
+		assert_same mine, @r.yield_once{ |x| mine }
+		assert_equal [ :yielding, [ :completed, RO4R::RemoteObject], :ensure],
+			outcomes.map{ |x| x.is_a?( Array) ? [ x[0], x[1].__class] : x }
+	end
+
+	### Undecodable messages ###
+
+	def test_undecodable_reply_raises_protocol_error
+		e= assert_raises( RO4R::ProtocolError) { @r.bad_value }
+		assert_includes e.message, "cannot load"
+		assert_equal 42, @r.ok # the connection survives
+	end
+
+	def test_undecodable_argument_raises_protocol_error
+		e= assert_raises( RO4R::ProtocolError) { @r.echo BadLoad.new }
+		assert_includes e.message, "cannot load"
+		assert_equal 42, @r.ok
+	end
+
+	def test_unknown_reference_in_arguments_raises_protocol_error
+		bogus= RO4R::RemoteObject.new 123456, @conn
+		e= assert_raises( RO4R::ProtocolError) { @r.echo [ bogus]}
+		assert_includes e.message, "123456"
+		assert_equal 42, @r.ok
+	end
+
+	def test_undecodable_block_argument_unwinds_the_server_method
+		# The server's yield fails on our side; it must see an error, not hang.
+		called= false
+		e= assert_raises( RO4R::ProtocolError) { @r.echo_yield( BadLoad.new) { called= true } }
+		assert_includes e.message, "cannot load"
+		refute called
+		assert_equal 42, @r.ok
+	end
+
+	### Objects of classes the peer does not define ###
+
+	def test_nested_references_do_not_need_the_class_on_the_peer
+		r= connect_to_peer.root
+		assert_equal :hi, r.top.hi
+		a= r.nested
+		assert_equal :hi, a[0].hi
+		assert_equal :hi, a[1][0].hi
+		assert_equal :hi, r.kw_values( k: r.top)[0][1].hi
+		# our objects, unknown to the peer, in arguments
+		mine= Object.new
+		assert_same mine, r.echo( mine)
+		assert_same mine, r.echo( [ mine])[0]
+		assert_same mine, r.echo( [[ mine]])[0][0]
+		assert_same mine, r.kw_values( k: mine)[0][1]
+		# and our proxies of its objects, passed back nested
+		assert r.has_hi?( r.top)
+		assert_equal :hi, r.echo( [ r.top])[0].hi
+	end
+
+	def test_unknown_classes_do_not_break_the_connection
+		r= connect_to_peer.root
+		e= assert_raises( RO4R::ProtocolError) { r.fail_unknown }
+		assert_includes e.message, "PeerOnlyError"
+		e= assert_raises( RO4R::ProtocolError) { r.value }
+		assert_includes e.message, "PeerOnlyValue"
+		e= assert_raises( RO4R::ProtocolError) { r.echo Point.new( 1, 2) }
+		assert_includes e.message, "Point"
+		assert_equal 1, r.echo( 1)
+	end
+
+	### Timeouts ###
+
+	def test_call_timeout
+		e= assert_raises( RO4R::TimeoutError) { @conn.call @r, :sleep_for, [ 0.3], timeout: 0.05}
+		assert_match(/0.05/, e.message)
+		assert_equal 42, @r.ok # usable right away
+		sleep 0.4 # the late reply is discarded
+		assert_equal 42, @r.ok
+	end
+
+	def test_connection_timeout_option
+		c= connect timeout: 0.05
+		assert_equal 0.05, c.timeout
+		assert_raises( RO4R::TimeoutError) { c.root.sleep_for 0.3}
+		assert_equal :woke, c.call( c.root, :sleep_for, [ 0.1], timeout: nil) # per-call override
+		c.close
+	end
+
+	def test_late_yield_after_timeout_unwinds_the_server_method
+		assert_raises( RO4R::TimeoutError) { @conn.call @r, :slow_yield, [], proc{}, timeout: 0.05}
+		wait_until{ !$outcomes.empty? }
+		assert_equal [ :ensure], outcomes
+		assert_equal 42, @r.ok
+	end
+
+	def test_interrupted_call_does_not_receive_a_stale_reply
+		require 'timeout'
+		assert_raises( Timeout::Error) { Timeout.timeout( 0.05) { @r.sleep_for 0.3 } }
+		assert_equal :fresh, @r.echo( :fresh)
+		sleep 0.4
+		assert_equal :fresh, @r.echo( :fresh)
+	end
+
+	def test_connect_timeout_is_accepted
+		c= connect connect_timeout: 1
+		assert_equal 42, c.root.ok
+		c.close
+	end
+
+	### Options ###
+
+	def test_allowlist
+		s= RO4R::Server.new Exported.new, 0, allow: [ :ok, 'echo']
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}"
+		assert_equal 42, c.root.ok
+		assert_equal 1, c.root.echo( 1)
+		e= assert_raises( SecurityError) { c.root.obj }
+		assert_includes e.message, "obj"
+		assert_raises( SecurityError) { c.root.send :ok } # the blocklist still applies
+		c.close
+		s.close
+		s= RO4R::Server.new Exported.new, 0, allow: proc{ |obj, m| obj.is_a?( Exported) && m== :ok }
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}"
+		assert_equal 42, c.root.ok
+		assert_raises( SecurityError) { c.root.echo 1 }
+		c.close
+		s.close
+	end
+
+	def test_poolsize_and_logger_options
+		log= CapturingLogger.new
+		s= RO4R::Server.new Exported.new, 0, poolsize: 1, logger: log
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}", poolsize: 2
+		assert_equal 2, c.poolsize
+		wait_until{ s.connections.size== 1}
+		assert_equal 1, s.connections.first.poolsize
+		assert_raises( RuntimeError) { c.root.boom }
+		wait_until{ log.lines.any? } # went to the connection's logger
+		assert_equal :debug, log.lines.first[0]
+		c.close
+		s.close
+	end
+
+	def test_on_close_option
+		closed= Queue.new
+		s= RO4R::Server.new Exported.new, 0, on_close: proc{ |conn| closed<< conn }
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}", on_close: proc{ |conn| closed<< :client }
+		assert_equal 42, c.root.ok
+		c.close
+		seen= [ closed.pop, closed.pop]
+		assert_includes seen, :client
+		assert_kind_of RO4R::Connection, seen.find{ |x| x!= :client }
+		s.close
+	end
+
+	def test_max_frame_on_send
+		c= connect max_frame: 200
+		e= assert_raises( RO4R::ProtocolError) { c.root.echo 'x'* 1000 }
+		assert_includes e.message, "max_frame"
+		assert_equal 42, c.root.ok
+		c.close
+	end
+
+	def test_max_frame_on_receive
+		s= RO4R::Server.new Exported.new, 0, max_frame: 200
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}"
+		e= assert_raises( RO4R::ProtocolError) { c.root.echo 'x'* 1000 } # skipped by the server
+		assert_includes e.message, "max_frame"
+		assert_equal 42, c.root.ok
+		# a reply too large for us to send is reported, not silently dropped
+		e= assert_raises( RuntimeError) { c.root.big( 1000) }
+		assert_includes e.message, "max_frame"
+		c.close
+		s.close
+	end
+
+	def test_frame_header_carries_kind_and_call_id
+		assert_equal [ RO4R::Msg::CALL, 7], [ RO4R::Call.new( 7, 0, :m, [], false).kind, RO4R::Call.new( 7, 0, :m, [], false).hid]
+		assert_equal [ RO4R::Msg::RETURN, 7], [ RO4R::Return.new( 7, nil, false).kind, RO4R::Return.new( 7, nil, false).hid]
+		assert_equal [ RO4R::Msg::YIELD, 9], [ RO4R::Yield.new( 7, 9, []).kind, RO4R::Yield.new( 7, 9, []).hid]
+		assert_equal [ RO4R::Msg::RELEASE, 0], [ RO4R::Release.new( 5).kind, RO4R::Release.new( 5).hid]
+	end
+
+	def test_cyclic_arrays_still_travel
+		a= [ 1]
+		a<< a
+		b= @r.echo a
+		assert_equal 1, b[0]
+		assert_same b, b[1]
+	end
+
+	def test_gc_churn_keeps_references_consistent
+		o= @r.shared
+		200.times do |i|
+			@r.obj
+			@r.echo [ @r.obj, o]
+			GC.start if i% 25== 0
+		end
+		GC.start
+		sleep 0.1
+		assert_equal 42, o.ok
+		assert_equal 42, @r.ok
+	end
+
 end

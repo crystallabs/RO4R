@@ -39,6 +39,13 @@ class Object
 	# users of Marshal in the process are unaffected. Otherwise, and for
 	# by-value objects, a class's own _dump (e.g. Time's) is honoured.
 	#
+	# Connection#make_reference replaces by-reference objects in the message
+	# itself, in Arrays and in keyword arguments before Marshal sees them, so
+	# this hook is only reached for objects nested inside other by-value
+	# objects (e.g. an instance variable of an Exception). Since Marshal
+	# writes the class name next to the _dump data, the peer must know the
+	# class of any object that travels this way.
+	#
 	# Defined in a prepended module rather than directly on Object, since Ruby
 	# warns about redefining Object#respond_to? (possible infinite loop). It is
 	# also prepended to by-value classes that define their own respond_to?
@@ -111,6 +118,7 @@ module RO4R
 	# anyway) is discarded. Assign any Logger-compatible object, i.e. one that
 	# responds to debug/warn/error and accepts a message or a block, to
 	# RO4R.logger to change this; e.g. RO4R.logger= Logger.new( $stdout).
+	# A connection may also be given its own logger (Connection.new logger:).
 	class StderrLogger
 		def debug( msg= nil) end
 		def warn( msg= nil) $stderr.puts "RO4R: #{msg || yield}" end
@@ -123,6 +131,20 @@ module RO4R
 
 	# Raised when a message cannot be sent because the peer is gone.
 	class ConnectionError< RuntimeError; end
+	# Raised when the peer does not reply within the call's timeout. The
+	# connection stays usable; the peer may still be executing the call.
+	class TimeoutError< RuntimeError; end
+	# Raised when a message cannot be decoded by its receiver (e.g. it holds
+	# an object of a class the receiver does not define) or exceeds the
+	# maximum frame size. The connection stays usable.
+	class ProtocolError< RuntimeError; end
+	# Raised inside a method that is yielding to a remote block when the
+	# block exits early (break, return, throw, or an exception that is not a
+	# StandardError) or when the caller has abandoned the call (timeout).
+	# It is not a StandardError, so that a bare rescue in the method does not
+	# swallow it; ensure blocks still run. It is not returned to the caller,
+	# who is gone already.
+	class BlockExit< Exception; end
 
 	# Keyword arguments in transit. A call made with keywords collects them
 	# in a trailing Hash flagged by ruby2_keywords; since Hashes travel by
@@ -136,6 +158,11 @@ module RO4R
 		def to_h() @pairs.to_h end
 		def marshal_dump() @pairs end
 		def marshal_load ary; @pairs= ary end
+		# Replace every key and value by the block's result.
+		def convert!
+			@pairs.map!{ |k, v| [ yield( k), yield( v)] }
+			self
+		end
 		# args with a trailing flagged Hash replaced by a Kwargs
 		def self.pack args
 			last= args.last
@@ -165,6 +192,17 @@ module RO4R
 			[ $1, $2.to_i]
 		else
 			[ str, default_port]
+		end
+	end
+
+	# Open a TCP connection, with an optional connect timeout in seconds.
+	def self.tcp_connect host, port, timeout= nil
+		if RUBY_VERSION>= '3.0'
+			TCPSocket.new host, port, connect_timeout: timeout
+		elsif timeout
+			Socket.tcp host, port, connect_timeout: timeout
+		else
+			TCPSocket.new host, port
 		end
 	end
 
@@ -242,43 +280,92 @@ end
 module RO4R
 	### Connection to a remote machine (server or client) ###
 	class Connection
+		# Largest message accepted or sent, in bytes, unless configured
+		# otherwise (max_frame:).
+		MAX_FRAME= 1<< 28 # 256 MiB
+		# Does Queue#pop accept a timeout (Ruby 3.2+)?
+		QUEUE_TIMEOUT= begin
+			Queue.new.pop( timeout: 0)
+			true
+		rescue ArgumentError, ThreadError # older: the Hash is taken as non_block
+			require 'timeout'
+			false
+		end
+		class PopTimeout< Exception; end # private_constant below
+
+		# host: "host", "host:port", "[v6addr]:port" or a connected IO.
+		# object: the local object exported to the peer as its root.
 		# safe: unused since Ruby 3.0 removed $SAFE; kept for API compatibility.
-		# The optional block is invoked with the connection once it is closed.
-		def initialize host='localhost', object= nil, safe= nil, &on_close
+		# Options:
+		# poolsize: idle worker threads kept per connection (default 5)
+		# logger: a Logger-compatible object for this connection (default:
+		#   RO4R.logger)
+		# timeout: seconds to wait for a reply before raising TimeoutError
+		#   (default nil: wait forever); Connection#call can override it
+		# connect_timeout: seconds to wait when connecting to a host
+		# max_frame: largest message, in bytes, sent or accepted
+		# allow: methods the peer may call on any object exported over this
+		#   connection: an Array of names, or a callable receiving (object,
+		#   method name) and returning true to allow the call. The blocklist
+		#   (Object::INSECURE_METHODS, names starting with '_') still applies.
+		# on_close: called with the connection once it is closed; the block
+		#   is an alternative way to pass it.
+		def initialize host= 'localhost', object= nil, safe= nil,
+				poolsize: 5, logger: nil, timeout: nil, connect_timeout: nil,
+				max_frame: MAX_FRAME, allow: nil, on_close: nil, &on_close_block
 			@safe= safe
-			@on_close= on_close
+			@on_close= on_close || on_close_block
+			@logger= logger
+			@timeout= timeout
+			@max_frame= max_frame
+			@allow= if allow.respond_to?( :call) or allow.nil?
+				allow
+			else
+				allow.map( &:to_sym)
+			end
 			@closed= false
 			@send_mutex= Mutex.new
 			@recv_mutex= Mutex.new
 			@local_mutex= Mutex.new
 			@object= object # local object (exported over connection)
-			@receiver= {} # thread id -> Queue of the call awaiting a reply
+			@seq= 0 # last call id handed out
+			@receiver= {} # call id -> Queue of the call awaiting a reply
 			@remote= ObjectSpace::WeakMap.new # remote_id -> RemoteObject (to reuse it)
 			@local= {} # local_id -> local Object (must not disappear while in use remotely)
 			@local_refs= Hash.new( 0) # local_id -> references handed to the peer
 			case host
 			when String
 				host, port= RO4R.parse_address host, Server::DefaultPort
-				@io= TCPSocket.new host, port
+				@io= RO4R.tcp_connect host, port, connect_timeout
 			else
 				@io= host
 			end
-			# request/response traffic: don't let Nagle hold back small writes
-			@io.setsockopt( :TCP, :NODELAY, 1) if @io.is_a?( TCPSocket)
+			if @io.__kind_of?( BasicSocket) and @io.local_address.ip?
+				# request/response traffic: don't let Nagle hold back small writes
+				@io.setsockopt :TCP, :NODELAY, 1
+				# notice a peer that vanished without closing the connection
+				@io.setsockopt :SOCKET, :KEEPALIVE, 1
+			end
 			@local[ ROOT_ID]= @object
 			@pool= [] # mailboxes (Queues) of idle worker threads for remote calls
-			@poolsize= 5 # how many idle workers to keep
-			@release_q= Queue.new # [id, count] of collected RemoteObjects, to release remotely
+			@poolsize= poolsize # how many idle workers to keep
+			# Messages to be sent by the outbox thread, on behalf of threads
+			# that must not block in a send: finalizers and the listen thread.
+			@outbox= Queue.new
 			@root= RemoteObject.new ROOT_ID, self # remote object exported to us
 			# Start the threads last: a reply to the peer's first call may be
 			# sent before this constructor returns.
 			@thread= Thread.new{ listen } # Wait for incoming messages
-			@release_thread= Thread.new{ release_loop }
+			@outbox_thread= Thread.new{ outbox_loop }
 		end
-		attr_reader :object, :root, :thread, :poolsize
+		attr_reader :object, :root, :thread, :poolsize, :timeout, :max_frame
+		attr_writer :logger
+
+		def logger() @logger || RO4R.logger end
+		def closed?() @closed end
 
 		def inspect
-			 "<#{self.to_s} @safe=#{@safe}>"
+			 "#<#{self.__class} #{@closed ? 'closed' : 'open'}>"
 		end
 
 		def join() @thread.join end
@@ -294,7 +381,8 @@ module RO4R
 
 		private
 		def add_remote id
-			### TODO: check whether to allow foreign objects or not
+			# The id may belong to an object the peer itself received from a
+			# third connection; calls on it are forwarded by the peer.
 			refs= [ 0]
 			ro= RemoteObject.new id, self, refs
 			@remote[ id]= ro # weak; the entry disappears when ro is collected
@@ -304,18 +392,19 @@ module RO4R
 		def make_finalizer id, refs
 			# Finalizers may run on any thread, including one that holds
 			# @send_mutex, so they must not send directly; queue the id for
-			# release_loop instead. refs must not be read before the object
-			# is dead, since references may still arrive for it until then.
-			q= @release_q
-			proc{ |oid| q.push [ id, refs[0]] rescue nil } # ClosedQueueError once disconnected
+			# the outbox thread instead. refs must not be read before the
+			# object is dead, since references may still arrive for it until
+			# then.
+			q= @outbox
+			proc{ |oid| q.push Release.new( id, refs[0]) rescue nil } # ClosedQueueError once disconnected
 		end
-		# Tell the peer that we no longer hold references to its objects.
-		def release_loop
-			while ( r= @release_q.pop)
-				send Release.new( *r)
+		# Send the messages queued by finalizers and the listen thread.
+		def outbox_loop
+			while ( msg= @outbox.pop)
+				transmit msg
 			end
 		rescue ConnectionError, ClosedQueueError
-			# peer gone; nothing more to release
+			# peer gone; nothing more to send
 		end
 		def local_reference object
 			# this ref will be handed over, local object must not disappear
@@ -362,58 +451,104 @@ module RO4R
 				remote_object reference.oid
 			end
 		end
-		def make_reference object, forceref= nil # before sending, from our POV
+		# Convert an outgoing object, from our POV: by-reference objects become
+		# references, by-value objects are returned as they are, except that
+		# Arrays and keyword arguments are searched for by-reference objects
+		# (without the class name that Marshal would write for them, so the
+		# peer need not know their classes). seen guards against cyclic
+		# Arrays, which are left to Marshal.
+		def make_reference object, forceref= nil, seen= nil
 			if object.__kind_of? RemoteObject
 				if object.__connection== self
 					RID.new object.__remote_id
 				else
 					local_reference object
 				end
-			else
-				if forceref or object.__by_ref?
-					local_reference object
-				else # by_val, i.e. copy
-					object
+			elsif object.__kind_of? Ref # converted already
+				object
+			elsif forceref or object.__by_ref?
+				local_reference object
+			elsif object.__kind_of? Array
+				if seen
+					return object if seen[ object.__id__]
+					seen[ object.__id__]= true
 				end
+				out= nil
+				i= 0
+				while i< object.size
+					o= object[ i]
+					c= if o.__kind_of?( Array) # only nested Arrays can form a cycle
+						make_reference o, nil, ( seen||= { object.__id__=> true})
+					else
+						make_reference o, nil, seen
+					end
+					unless c.__id__== o.__id__
+						out||= object.dup # keeps the class and instance variables
+						out[ i]= c
+					end
+					i+= 1
+				end
+				out || object
+			elsif object.__kind_of? Kwargs
+				object.convert!{ |o| make_reference o, nil, seen}
+			else # by_val, i.e. copy
+				object
 			end
 		end
-		def call object, name, args=[], block= nil, byref= false
+		# Call `name` on the peer's `object` (a RemoteObject, or a local object
+		# the peer holds a reference to) and return the result. timeout
+		# overrides the connection's; nil waits forever.
+		def call object, name, args=[], block= nil, byref= false, timeout: @timeout
 			oid= if object.__kind_of? RemoteObject
 				object.__remote_id
 			else
 				object.__id__
 			end
-			tid= Thread.current.__id__
 			cls= byref ? RefCall : Call
-			msg= cls.new tid, oid, name, args, !block.nil?
-			await_return msg, &block
+			msg= cls.new next_id, oid, name, make_reference( args), !block.nil?
+			await_return msg, timeout, &block
 		end
-		def byref object, name, args=[], block= nil
-			call object, name, args, block, true
+		def byref object, name, args=[], block= nil, timeout: @timeout
+			call object, name, args, block, true, timeout: timeout
 		end
 
 		private
+		def next_id
+			@recv_mutex.synchronize{ @seq+= 1}
+		end
 		def remote_yield tid, args
-			msg= Yield.new tid, Thread.current.__id__, args
-			await_return msg
+			msg= Yield.new tid, next_id, make_reference( args)
+			await_return msg, nil
+		end
+		# Wait up to timeout seconds for something to be pushed on q; nil
+		# when nothing was.
+		def pop q, timeout
+			if QUEUE_TIMEOUT
+				q.pop timeout: timeout
+			elsif timeout
+				Timeout.timeout( timeout, PopTimeout) { q.pop }
+			else
+				q.pop
+			end
+		rescue PopTimeout
+			nil
 		end
 		# Send msg and wait for the peer's reply on a Queue registered under
-		# our thread id, which the peer echoes back. Yields from the peer are
-		# served in between; the Queue is unregistered while the block runs,
-		# so a nested call from the block can register its own.
-		def await_return msg
-			tid= Thread.current.__id__
+		# the message's call id, which the peer echoes back. Yields from the
+		# peer are served in between.
+		def await_return msg, timeout
+			id= msg.hid
 			q= Queue.new
 			while true
 				@recv_mutex.synchronize do
 					raise ConnectionError, "Unable to reach peer" if @closed
-					@receiver[ tid]= q
+					@receiver[ id]= q
 				end
 				begin
-					send msg
-					msg= q.pop
+					transmit msg
+					msg= pop q, timeout
 				ensure
-					@recv_mutex.synchronize{ @receiver.delete tid}
+					@recv_mutex.synchronize{ @receiver.delete id}
 				end
 				case msg
 				when Return # got our answer
@@ -423,15 +558,28 @@ module RO4R
 						return msg.obj
 					end
 				when Yield  # need to call block
+					yid= msg.yid
+					reply= nil
 					begin
 						args, kw= Kwargs.unpack msg.arg
 						r= kw ? yield( *args, **kw) : yield( *args)
-						msg= Return.new msg.yid, r, false
-					rescue => e
-						msg= Return.new msg.yid, e, true
+						reply= Return.new yid, make_reference( r), false
+					rescue StandardError=> e
+						reply= Return.new yid, e, true
+					ensure
+						# break, return, throw or a non-StandardError exception
+						# left the block: the peer is still inside its yield,
+						# waiting for the result; make it unwind.
+						unless reply
+							e= BlockExit.new "remote block exited early"
+							transmit( Return.new( yid, e, true)) rescue nil
+						end
 					end
+					msg= reply
 				when Exception
 					raise msg
+				when nil
+					raise TimeoutError, "no reply within #{timeout}s"
 				else
 					raise RuntimeError, "Cannot interpret message #{msg}"
 				end
@@ -465,6 +613,13 @@ module RO4R
 			end
 			mbox
 		end
+		def allowed? obj, name
+			if @allow.respond_to? :call
+				@allow.call obj, name
+			else
+				@allow.include? name
+			end
+		end
 		def handle_call msg
 			if @local.has_key? msg.oid
 				obj= @local[ msg.oid]
@@ -475,22 +630,30 @@ module RO4R
 				raise TypeError, "Receiver ##{msg.oid} not found"
 			end
 			if msg.nme
-				if msg.nme.to_s[0..0]=='_'
+				name= msg.nme.to_sym
+				if name.to_s[0..0]=='_'
 					raise NoMethodError, "Call forbidden"
+				end
+				if @allow and not allowed?( obj, name)
+					raise SecurityError, "method '#{name}' is not allowed"
 				end
 				blk= if msg.blk
 					proc { | *arg| remote_yield msg.tid, Kwargs.pack( arg)}.ruby2_keywords
 				end
-				r= obj.__remote_call msg.nme, msg.arg, blk
+				r= obj.__remote_call name, msg.arg, blk
 			else
 				r= obj
 			end
 			# Explicit conversion here so that return-by-ref call can be
 			# honored (but ignore byref request for nil)
 			forceref= msg.kind_of?( RefCall) && RefCall.enabled? && !r.__nil?
-			send Return.new( msg.tid, make_reference( r, forceref), false)
+			transmit Return.new( msg.tid, make_reference( r, forceref), false)
+		rescue BlockExit=> e
+			# the caller is gone (its block exited early, or it gave up
+			# waiting); nobody to reply to
+			logger.debug{ "remote call '#{msg.nme}' abandoned: #{e.message}"}
 		rescue Exception=> e
-			RO4R.logger.debug do
+			logger.debug do
 				"error in remote call '#{msg.nme}': #{e.class}: #{e.message}\n" +
 					Array( e.backtrace).join( "\n")
 			end
@@ -498,12 +661,12 @@ module RO4R
 		end
 
 		# Return an exception to the caller. If it cannot be marshalled (e.g. it
-		# holds a Proc or an IO), send a plain RuntimeError instead, so that the
-		# remote caller is not left waiting forever.
+		# holds a Proc or an IO) or is too large, send a plain RuntimeError
+		# instead, so that the remote caller is not left waiting forever.
 		def send_error tid, e
-			send Return.new( tid, e, true)
-		rescue TypeError, ArgumentError
-			send Return.new( tid, RuntimeError.new( "#{e.class}: #{e.message}"), true)
+			transmit Return.new( tid, e, true)
+		rescue TypeError, ArgumentError, ProtocolError
+			transmit Return.new( tid, RuntimeError.new( "#{e.class}: #{e.message}"), true)
 		end
 
 		# Read up to maxlen bytes, at least one; raise EOFError when the peer is
@@ -512,15 +675,69 @@ module RO4R
 			io.readpartial maxlen
 		end
 		READ_CHUNK= 65536
-		# Return the payload of the next length-prefixed frame. `buf` holds bytes
-		# read ahead of the frame boundary and is reused across calls.
+		# Frame header: payload length, message kind, and the id of the call
+		# the message concerns (see Msg#hid).
+		HEADER= 'L<Cq<'
+		HEADER_SIZE= 13
+		def fill buf, n
+			buf<< read( @io, READ_CHUNK) while buf.bytesize< n
+		end
+		# Return [kind, id, payload] of the next frame. `buf` holds bytes read
+		# ahead of the frame boundary and is reused across calls. A frame
+		# larger than max_frame is skipped and returned with a nil payload.
 		def read_frame buf
-			buf<< read( @io, READ_CHUNK) while buf.bytesize< 4
-			len= buf.unpack1( "L<")
-			buf<< read( @io, READ_CHUNK) while buf.bytesize< 4+ len
-			frame= buf.byteslice( 4, len)
-			buf[ 0, 4+ len]= ''
-			frame
+			fill buf, HEADER_SIZE
+			len, kind, id= buf.unpack HEADER
+			buf[ 0, HEADER_SIZE]= ''
+			if @max_frame and len> @max_frame
+				while len> 0
+					fill buf, 1
+					n= [ len, buf.bytesize].min
+					buf[ 0, n]= ''
+					len-= n
+				end
+				return [ kind, id, nil]
+			end
+			fill buf, len
+			frame= buf.byteslice( 0, len)
+			buf[ 0, len]= ''
+			[ kind, id, frame]
+		end
+		# Called from the listen thread when a frame cannot be turned into a
+		# message: report the failure to whoever is waiting on it, on either
+		# side, instead of dropping the connection.
+		def reject kind, id, error
+			desc= "#{Msg::KINDS.key( kind) || kind} message: #{error.class}: #{error.message}"
+			logger.warn "cannot decode #{desc}"
+			err= ProtocolError.new "peer could not decode #{desc}"
+			case kind
+			when Msg::CALL, Msg::YIELD # the peer's thread is waiting for us
+				enqueue Return.new( id, err, true)
+			when Msg::RETURN # one of ours is waiting for the peer
+				deliver Return.new( id, ProtocolError.new( "cannot decode #{desc}"), true)
+			end
+		end
+		# Queue msg for the outbox thread.
+		def enqueue msg
+			@outbox.push msg
+		rescue ClosedQueueError
+			# connection closing; nothing more to send
+		end
+		# Hand a Return or Yield to the call waiting for it.
+		def deliver msg
+			q= @recv_mutex.synchronize{ @receiver[ msg.tid]}
+			if q
+				q.push msg
+			elsif msg.__kind_of? Yield
+				# The call was abandoned (timeout, interrupt) after the peer
+				# started serving it; its method is now waiting inside a
+				# yield, so make it unwind.
+				logger.debug{ "yield for abandoned call #{msg.tid}"}
+				e= BlockExit.new "the caller abandoned the call"
+				enqueue Return.new( msg.yid, e, true)
+			else
+				logger.debug{ "reply for abandoned call #{msg.tid}"}
+			end
 		end
 
 		def listen
@@ -529,21 +746,26 @@ module RO4R
 			begin
 				buf= String.new( capacity: READ_CHUNK)
 				while true
-					msg= Marshal.load read_frame( buf)
+					kind, id, frame= read_frame buf
+					unless frame
+						reject kind, id, ProtocolError.new( "larger than max_frame (#{@max_frame} bytes)")
+						next
+					end
+					begin
+						msg= Marshal.load frame
+					rescue StandardError=> e # unknown class, _load failure, bad reference, ...
+						reject kind, id, e
+						next
+					end
 					case msg
 					when Call
 						local_call msg
 					when Return, Yield
-						q= @recv_mutex.synchronize{ @receiver[ msg.tid]}
-						if q
-							q.push msg
-						else
-							RO4R.logger.warn "no thread waiting for #{msg.__class} #{msg.tid}"
-						end
+						deliver msg
 					when Release
 						release_local msg.oid, msg.count
 					else
-						RO4R.logger.warn "ignoring unexpected #{msg.__class} message"
+						logger.warn "ignoring unexpected #{msg.__class} message"
 					end
 				end
 			rescue Exception=> e
@@ -551,7 +773,7 @@ module RO4R
 				# report those, but still run the cleanup below so that threads
 				# waiting on this connection are woken up with the error.
 				unless e.is_a?( EOFError) or e.is_a?( Errno::ECONNRESET)
-					RO4R.logger.error{ "connection closed: #{e.inspect}"}
+					logger.error{ "connection closed: #{e.inspect}"}
 				end
 				@io.close
 				# Wake up callers waiting for a reply. @closed is set under
@@ -570,15 +792,16 @@ module RO4R
 				@local_mutex.synchronize{ @local.clear; @local_refs.clear} # free local objects
 				# stop the helper threads
 				@closed= true
-				@release_q.close
+				@outbox.close
 				@recv_mutex.synchronize{ @pool.each( &:close); @pool.clear}
 				@on_close.call self if @on_close
 			end
 		end
 
-		def send msg
+		# Marshal msg and write it to the peer as one frame.
+		def transmit msg
 			raise ConnectionError, "Unable to reach peer" if @closed
-			RO4R.logger.warn "sending a #{msg.__class} instead of a Msg" unless msg.__kind_of? Msg
+			logger.warn "sending a #{msg.__class} instead of a Msg" unless msg.__kind_of? Msg
 			t= Thread.current
 			t[:__conn]= self
 			t[:__ro4r_marshal]= true
@@ -587,28 +810,44 @@ module RO4R
 			ensure
 				t[:__ro4r_marshal]= nil
 			end
+			if @max_frame and data.bytesize> @max_frame
+				raise ProtocolError, "message of #{data.bytesize} bytes exceeds max_frame (#{@max_frame} bytes)"
+			end
+			header= [ data.bytesize, msg.kind, msg.hid].pack( HEADER)
 			@send_mutex.synchronize do
-				@io.write [ data.bytesize].pack( "L<"), data # one writev, no concatenation
+				@io.write header, data # one writev, no concatenation
 			rescue IOError, SystemCallError=> e
 				raise ConnectionError, "Unable to reach peer (#{e.message})"
 			end
 			nil
 		end
+		private_constant :PopTimeout
 	end
 
 	### Serializable messages ###
 	# Messages travel by value as an Array of their fields (marshal_dump), so
-	# that the wire carries no instance variable names.
+	# that the wire carries no instance variable names. The frame header
+	# repeats the kind of the message and the id of the call it concerns
+	# (`hid`: the sender's call id for Call and Yield, the receiver's for
+	# Return), so that a message the receiver cannot decode can still be
+	# answered with an error.
 	class Msg
 		include ByVal
+		CALL, RETURN, YIELD, RELEASE= 1, 2, 3, 4
+		KINDS= { call: CALL, return: RETURN, yield: YIELD, release: RELEASE}.freeze
+		def hid() 0 end
 	end
 	# method call
 	class Call< Msg
+		# thread_id: an id unique among the caller's pending calls (a call
+		# id; called tid for historical reasons), echoed in the Return
 		def initialize thread_id, object_id, method_name, args, block=nil
 			@tid, @oid, @nme= thread_id, object_id, method_name
 			@arg, @blk= args, block
 		end
 		attr_reader :tid, :oid, :nme, :arg, :blk
+		def kind() CALL end
+		def hid() @tid end
 		def marshal_dump
 			[ @tid, @oid, @nme, @arg, @blk]
 		end
@@ -626,12 +865,15 @@ module RO4R
 			def enabled?() @enabled end
 		end
 	end
-	# yield to remote block
+	# yield to remote block: tid is the caller's id of the call being served,
+	# yid the id under which the yielding side waits for the block's result
 	class Yield< Msg
 		def initialize threadid, yield_threadid, args
 			@tid, @yid, @arg = threadid, yield_threadid, args
 		end
 		attr_reader :tid, :yid, :arg
+		def kind() YIELD end
+		def hid() @yid end
 		def marshal_dump
 			[ @tid, @yid, @arg]
 		end
@@ -646,6 +888,8 @@ module RO4R
 			@tid, @obj, @err= thread_id, object, exception
 		end
 		attr_reader :tid, :obj, :err
+		def kind() RETURN end
+		def hid() @tid end
 		def marshal_dump
 			[ @tid, @obj, @err]
 		end
@@ -660,6 +904,7 @@ module RO4R
 			@oid, @count= id, count
 		end
 		attr_reader :oid, :count
+		def kind() RELEASE end
 		def marshal_dump
 			[ @oid, @count]
 		end
@@ -677,7 +922,9 @@ module RO4R
 		attr_reader :connections, :server # server: the listening socket
 
 		# safe: unused since Ruby 3.0 removed $SAFE; kept for API compatibility.
-		def initialize object= Hash.new, port= DefaultPort, safe= nil
+		# options are passed to Connection.new for every accepted connection
+		# (poolsize:, logger:, timeout:, max_frame:, allow:, on_close:).
+		def initialize object= Hash.new, port= DefaultPort, safe= nil, **options
 			### root object must be passed by ref:
 			raise ArgumentError, "#{object} must be sent by reference" unless object.__by_ref?
 			@server= case port
@@ -690,6 +937,7 @@ module RO4R
 			else
 				port # probably an IO
 			end
+			on_close= options.delete :on_close
 			# Automatically accept incoming connections; a connection removes
 			# itself from the list once its peer disconnects.
 			@connections= []
@@ -699,8 +947,9 @@ module RO4R
 					while true
 						io= @server.accept
 						@mutex.synchronize do
-							@connections << Connection.new( io, object, safe) do |c|
+							@connections << Connection.new( io, object, safe, **options) do |c|
 								@mutex.synchronize{ @connections.delete c}
+								on_close.call c if on_close
 							end
 						end
 					end
