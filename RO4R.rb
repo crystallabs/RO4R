@@ -34,16 +34,21 @@ class Object
 		MARSHAL.load str
 	end
 	alias_method :__respond_to?, :respond_to?
-	def respond_to? method, priv= false
-		if :_dump== method || :_dump_as== method ## cheat on Marshal.dump
-			 # use _dump if we have to turn the object into a reference
-			 # otherwise Marshal must do it on its own, possibly with the aid of
-			 # marshal_dump and marshal_load methods exposed by the object
-			__by_ref?
-		else
-			__respond_to? method, priv
+	# Defined in a prepended module rather than directly on Object, since Ruby
+	# warns about redefining Object#respond_to? (possible infinite loop).
+	module RespondTo
+		def respond_to? method, priv= false
+			if :_dump== method || :_dump_as== method ## cheat on Marshal.dump
+				 # use _dump if we have to turn the object into a reference
+				 # otherwise Marshal must do it on its own, possibly with the aid of
+				 # marshal_dump and marshal_load methods exposed by the object
+				__by_ref?
+			else
+				__respond_to? method, priv
+			end
 		end
 	end
+	prepend RespondTo
 	def _dump depth= -1
 		conn= Thread.current[:__conn]
 		MARSHAL.dump conn.make_reference( self, true), depth
@@ -303,7 +308,7 @@ module RO4R
 				when Yield  # need to call block
 					begin
 						arg= msg.arg
-						r= yield *arg
+						r= yield(*arg)
 						msg= Return.new msg.yid, r, false
 					rescue => e
 						msg= Return.new msg.yid, e, true
@@ -379,10 +384,11 @@ module RO4R
 			#tm= Time.now
 			ret= yield
 			#puts "#{label}: #{1e3*(Time.now-tm)} ms => #{res||ret}"
+			ret
 		end
 
 		def read io, len # intended to be redefined if necessary
-			@io.read len
+			@io.read( len) or raise EOFError, "peer disconnected"
 		end
 
 		def listen
@@ -398,7 +404,7 @@ module RO4R
 					#}
 					#?! why does this cause a >50x slow-down? :
 					#__time 'read1' {
-					data= ''
+					data= String.new
 					buflen= 4
 					while buflen> 0
 						aux= read @io, buflen
@@ -413,7 +419,7 @@ module RO4R
 					#IO::select [@io], nil, nil
 					#}
 					#__time 'read2' {
-					data= ''
+					data= String.new
 					while len> 0
 						aux= read @io, len
 						len-= aux.length
@@ -449,13 +455,11 @@ module RO4R
 						@local.delete msg.oid
 					end
 				end
-			# rescue EOFError, Errno::ECONNRESET => e
-				# Ignore this error, as it is just a client disconnecting.
-				# Remote references will be invalidated due to the
-				# remote host disconnecting, so we don't need
-				# to track it here.
 			rescue Exception=> e
-				$stderr.puts e.inspect
+				# EOFError / ECONNRESET just mean the peer disconnected; don't
+				# report those, but still run the cleanup below so that threads
+				# waiting on this connection are woken up with the error.
+				$stderr.puts e.inspect unless e.is_a?( EOFError) or e.is_a?( Errno::ECONNRESET)
 				Thread.current[:err]= e
 				@io.close
 				@recv_mutex.synchronize do
@@ -536,7 +540,7 @@ module RO4R
 			[ N, @tid, @oid, @nme, @arg, @blk]
 		end
 		def self._load ary
-			new *ary
+			new(*ary)
 		end
 	end
 	# method call
@@ -552,7 +556,7 @@ module RO4R
 			[ N, @tid, @oid, @nme, @arg, @blk]
 		end
 		def self._load ary
-			Msg::MSGMAP[ N].new *ary
+			Msg::MSGMAP[ N].new(*ary)
 		end
 	end
 	# yield to remote block
@@ -566,7 +570,7 @@ module RO4R
 			[ N, @tid, @yid, @arg]
 		end
 		def self._load ary
-			new *ary
+			new(*ary)
 		end
 	end
 	# return value or exception return message
@@ -582,7 +586,7 @@ module RO4R
 			[ N, @tid, @obj, @err]
 		end
 		def self._load ary
-			new *ary
+			new(*ary)
 		end
 	end
 	# release the reference on the remote side protecting a local RemoteObject
@@ -596,7 +600,7 @@ module RO4R
 			[ N, @oid]
 		end
 		def self._load ary
-			new *ary
+			new(*ary)
 		end
 	end
 
