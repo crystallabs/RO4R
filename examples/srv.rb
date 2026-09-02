@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
 
-require 'RO4R'
+require 'ro4r'
 
 $r= {}
 

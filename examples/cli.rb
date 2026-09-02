@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 
 require 'benchmark'
-require 'RO4R'
+require 'ro4r'
 
 $c= RO4R::Connection.new( ARGV.first || 'localhost')
 $r= $c.root

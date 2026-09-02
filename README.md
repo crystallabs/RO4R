@@ -1,16 +1,49 @@
 # RO4R - Remote Objects for Ruby 2.7+
 
-Git export of RO4R, a Ruby RPC library that has been in production use since 2007.
+RO4R is a Ruby RPC library that has been in production use since 2007. A server
+exports one object over TCP; clients call methods on it, on the objects it
+returns, and on the blocks they pass, as if everything were local.
 
 ## Supported Ruby versions
 
-A `.ruby-version` file pins 4.0.6 for rbenv and similar tools.
+Ruby 2.7 up to and including Ruby 4.0, in any combination of client and server
+versions. (2.7 is required because remote object references are tracked in an
+`ObjectSpace::WeakMap` keyed by integer ids.) A `.ruby-version` file pins 4.0.6
+for rbenv and similar tools.
 
-Supports all Ruby versions from 2.7 up to and including Ruby 4.0, in all combinations of
-client and server versions. (2.7 is required because remote object references are now
-tracked in an `ObjectSpace::WeakMap` keyed by integer ids.)
+For older Rubies use the git history: the revision preceding the Ruby 4.0
+update supports 2.4 to 2.6 (it still used `ObjectSpace._id2ref`), and release
+1.0.0 supports 1.8 to 2.3.
 
-For support on older versions, please see below under "Other Ruby versions".
+## Installation
+
+```
+  gem build ro4r.gemspec
+  gem install ro4r-*.gem
+```
+
+or, from a checkout, add `-Ilib` to the Ruby command line. The library is
+loaded with `require 'ro4r'`. (`RO4R.rb` at the top of the checkout is a shim
+so that the old `ruby -I. -r RO4R` still works.)
+
+## Quick start
+
+Server:
+
+```ruby
+  require 'ro4r'
+  shared= {}
+  RO4R::Server.new( shared).join   # listens on 127.0.0.1:4044
+```
+
+Client:
+
+```ruby
+  require 'ro4r'
+  r= RO4R::Connection.new( 'localhost:4044').root
+  r[:counter]= 1
+  r.each{ |k, v| puts "#{k}=#{v}" }   # the block runs here, called from the server
+```
 
 ## Security
 
@@ -24,42 +57,47 @@ It is **not** safe to expose to untrusted peers:
   `Object::INSECURE_METHODS`) and any method whose name starts with `_`.
   A blocklist is not a sandbox; if you need stricter control, override
   `__secure_method?` in your exported classes with an allowlist.
+* Methods are invoked with `public_send`, so private methods stay private even
+  if the exported class overrides `respond_to?`.
+* The server listens on `127.0.0.1` by default. Pass `"0.0.0.0:4044"` (or
+  `"[::]:4044"`) to `Server.new` to listen on all interfaces.
 * The `safe` argument to `Connection.new` and `Server.new` is ignored, since
   Ruby 3.0 removed `$SAFE`. It is kept only for API compatibility.
 
 ## Wire format
 
 Each message is a 32-bit little-endian length prefix followed by the marshalled
-payload; object ids inside references are 64-bit signed little-endian. Sockets
-are set to `TCP_NODELAY`. `Connection#read(io, maxlen)` is the single point
-through which bytes enter and may be overridden; it must return between 1 and
-`maxlen` bytes or raise `EOFError`.
+payload. Messages are marshalled as arrays of their fields (`marshal_dump`), and
+object ids inside references are 64-bit signed little-endian. Each side's root
+object has id 0. A `Release` message carries the number of references being
+released. Sockets are set to `TCP_NODELAY`. `Connection#read(io, maxlen)` is the
+single point through which bytes enter and may be overridden; it must return
+between 1 and `maxlen` bytes or raise `EOFError`.
 
-**This is incompatible with releases before the Ruby 4.0 update**, which used
-native-endian 32-bit object ids: both peers must run the same generation of RO4R.
-The change removes a silent wraparound of object ids past 2^31 in long-running
-processes, and lets big-endian hosts interoperate.
+**Both peers must run the same generation of RO4R.** The 2.0 format is
+incompatible with earlier releases (which had wider messages, native-endian
+32-bit ids, and a root id that differed between 32- and 64-bit hosts).
 
 ## How to see it work
 
 1. Check out the files:
 
 ```
-  git clone git://github.com/crystallabs/RO4R.git
+  git clone https://github.com/crystallabs/RO4R.git
 ```
 
 1. In one terminal, start an example server. It will listen on port 4044, export one Ruby Hash variable, and provide the main loop:
 
 ```
   cd RO4R
-  ruby -I. examples/srv.rb
+  ruby -Ilib examples/srv.rb
 ```
 
 1. In another terminal, start an example client. It will attach to the server and shared Hash, iterate a counter 10_000 times, and then print the benchmark statistics and the final contents of the Hash:
 
 ```
   cd RO4R
-  ruby -I. examples/cli.rb
+  ruby -Ilib examples/cli.rb
 ```
 
 When the client disconnects, the server silently drops the connection and keeps
@@ -71,7 +109,7 @@ When you run the above, it will print statistics such as:
 
 ```
 0.390000   0.390000   0.780000 (  1.451144)
-{:counter=>9999, 1=>A, 2=>#<A:0xb7741e38>}
+{1=>A, 2=>#<A:0xb7741e38>, :counter=>10001}
 ```
 
 The first line is the benchmark output, showing user, system, total and real times. (That's benchmark for the 10,000 iterations that the example client does).
@@ -83,12 +121,14 @@ The second line are the contents of the shared Hash object. In it you see the :c
 The automated test suite (minitest, bundled with Ruby) runs with:
 
 ```
-  ruby -I. test/test_ro4r.rb
+  rake test
 ```
 
-It starts a server on an ephemeral port inside the test process and covers
-calls, blocks, exception propagation, the method blocklist, connection
-tracking and shutdown, and reference handling.
+or `ruby -Ilib test/test_ro4r.rb`. It starts a server on an ephemeral port
+inside the test process and covers calls, keyword arguments, blocks, exception
+propagation, the method blocklist, reference counting, connection tracking and
+shutdown. Any RO4R thread dying with an unhandled exception fails the run.
+The GitHub Actions workflow runs it on every supported Ruby.
 
 To test RO4R manually, you can create two processes (client and server), and then display and modify variables and invoke remote functions.
 
@@ -96,12 +136,12 @@ To test RO4R manually, you can create two processes (client and server), and the
 
 ```
 $ cd RO4R
-$ irb -I. -r examples/cli.rb
+$ irb -Ilib -r examples/cli.rb
 
 # ... statistics will be printed ...
 
 > $r[:counter]
-9999
+10001
 > $r[:test_value]= 717
 #-> 717
 ```
@@ -121,10 +161,10 @@ You can also open a new/third terminal in which you can query all the changes:
 
 ```
 $ cd RO4R
-$ irb -I. -r examples/cli.rb
+$ irb -Ilib -r examples/cli.rb
 
 > $r
-{:counter=>9999, 1=>A, 2=>#<A:0xb7745e34>, :test_value=>717}
+{1=>A, 2=>#<A:0xb7745e34>, :counter=>20001, :test_value=>717}
 ```
 
 ## Benchmarks
@@ -150,12 +190,20 @@ Older Benchmarks from 2008:
 
 ## Programming notes
 
+### Addresses
+
+`Connection.new` takes `"host"`, `"host:port"`, an IPv6 address such as
+`"::1"` or `"[::1]:4044"`, or an already connected IO. `Server.new` takes a
+port number, `"port"`, `"address:port"`, `"[v6address]:port"`, or a listening
+socket.
+
 ### Shutting down
 
 `RO4R::Server#close` stops accepting connections, disconnects every client and
 waits for their handler threads to finish. `RO4R::Connection#close` disconnects
-a single client. Calls made on a connection whose peer has gone away raise
-`RO4R::ConnectionError` (a `RuntimeError`, message "Unable to reach peer").
+a single client. Calls made on a connection whose peer has gone away, and calls
+that were waiting for a reply when it went away, raise `RO4R::ConnectionError`
+(a `RuntimeError`, message "Unable to reach peer").
 
 ### Concurrency
 
@@ -165,6 +213,36 @@ Workers are created on demand and up to five idle ones are kept per
 connection (`Connection#poolsize`). There is deliberately no upper bound: a
 remote method may call back into the client, which may call the server again
 before the first call has returned.
+
+Each waiting call has its own reply queue; the thread that reads the socket
+never blocks on anything but the socket, so a peer that is slow to read cannot
+stall the delivery of replies.
+
+### Keyword arguments
+
+Keyword arguments work across the wire: `r.find( name: 'x')` calls
+`find( name: 'x')` remotely, and a block may be yielded keywords. A Hash passed
+positionally stays positional (and, like every Hash, is passed by reference).
+
+### Passing objects: by reference or by value
+
+Objects are passed by reference unless their class is by value. By value are
+`Array`, `String`, `Symbol`, `Integer`, `Float`, `Range`, `Regexp`, `Time`,
+`Exception`, `nil`, `true` and `false`; classes and modules are passed by name.
+Everything else, **including `Hash`**, is passed by reference: the receiver
+gets a `RO4R::RemoteObject` proxy and every method call on it goes back to the
+owner. To pass your own class by value, `include ByVal` in it (and give it
+`_dump`/`_load` or `marshal_dump`/`marshal_load` if the default object dump
+is not suitable). Both peers must know the class of any by-reference object,
+because Marshal writes its name.
+
+### References and garbage collection
+
+An object that has been passed by reference is kept alive by its owner until
+the peer's proxy for it is garbage collected. Proxies are reused for the same
+remote object, and the owner counts how many references it handed out, so an
+object passed again while an earlier proxy is being collected stays exported.
+A proxy's `__refs` shows the count it will release.
 
 ### Logging
 
@@ -178,22 +256,6 @@ assign any object responding to `debug`, `warn` and `error` (a standard
   require 'logger'
   RO4R.logger= Logger.new( $stdout)
 ```
-
-### Shared classes
-
-Generally, you will share instances of classes that are known to both the server and the clients.
-
-But it is also possible to share objects that clients know nothing about.
-
-Included in the distribution is rmarshal/, a modification of
-Ruby marshaller that you need to compile and 'require' into
-your Ruby app on the server side (the one that exports the object),
-without any other changes.
-
-With that, the clients will transparently be able to use the remote
-object even though they don't know its Class.
-
-NOTE: rmarshal.c is currently out of date, and the version included works with Ruby 1.8.
 
 ### Marshal and by-value classes
 
@@ -216,10 +278,16 @@ value is not needed. This is cleaner and can also save you from errors
 if the (unnecessary) return value would be a weird object that Ruby
 marshaller can't serialize and pass back to the client.
 
+### Return by reference
+
+`Connection#byref( object, method, args)` asks the peer to return the result by
+reference even if it is a by-value object. The peer honours this only after
+`RO4R::RefCall.enable` has been called there; otherwise it is an ordinary call.
+
 ### Code stability
 
 RO4R has been in production use with Ruby 1.8, 1.9, and later since 2007.
-Verified on Ruby 4.0 with `ruby -w -W:deprecated` producing no warnings.
+Verified on Ruby 3.1 and 4.0 with `ruby -w -W:deprecated` producing no warnings.
 
 Note for users of Ruby 3.1 and later: exceptions raised by a remote method are
 now correctly returned to the caller by value. Previously they leaked through as
@@ -227,17 +295,22 @@ remote references, and re-raising them on the caller side recursed until
 `SystemStackError`. Exceptions that cannot be marshalled (e.g. ones with singleton
 methods) are returned as a `RuntimeError` carrying the original class and message.
 
-## Other Ruby versions
+## Changes in 2.0
 
-For Ruby 2.4 to 2.6, use the git revision preceding the Ruby 4.0 update (the one
-still using `ObjectSpace._id2ref`).
+* Keyword arguments are passed correctly under Ruby 3 (they used to arrive as
+  a positional Hash and raise `ArgumentError`).
+* Callers waiting for a reply when the connection drops always get
+  `ConnectionError`; two races could previously leave them hanging or kill the
+  reader thread.
+* Exported objects are reference counted, closing a race between a proxy being
+  collected and the same object being sent again.
+* The server binds to loopback by default.
+* Messages are smaller on the wire (a typical call went from 71 to 42 bytes).
+* IPv6 addresses are accepted.
+* Packaged as a gem (`lib/ro4r.rb`, `require 'ro4r'`); `RO4R.rb` remains as a
+  shim. The Ruby 1.8 C marshaller (`rmarshal/`) has been removed.
 
-For use with lower versions (Ruby 1.8 to Ruby 2.3) , please either use RO4R release 1.0.0
-or edit RO4R.rb to replace "safe= 1" with "safe= 3" and uncomment the line saying
-"Bignum, Fixnum".
+## License
 
-The C marshaller (rmarshall) is operational only for Ruby 1.8 versions.
-
-## TODO
-
-* Add rmarshall for newer Ruby versions
+RO4R is free software, licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version. See the LICENSE file.
