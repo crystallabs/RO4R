@@ -89,6 +89,24 @@ class Object
 end
 
 module RO4R
+	# Minimal default logger: warnings and errors go to $stderr, debug output
+	# (e.g. exceptions raised by remote calls, which are returned to the caller
+	# anyway) is discarded. Assign any Logger-compatible object, i.e. one that
+	# responds to debug/warn/error and accepts a message or a block, to
+	# RO4R.logger to change this; e.g. RO4R.logger= Logger.new( $stdout).
+	class StderrLogger
+		def debug( msg= nil) end
+		def warn( msg= nil) $stderr.puts "RO4R: #{msg || yield}" end
+		def error( msg= nil) $stderr.puts "RO4R: #{msg || yield}" end
+	end
+	@logger= StderrLogger.new
+	class << self
+		attr_accessor :logger
+	end
+
+	# Raised when a message cannot be sent because the peer is gone.
+	class ConnectionError< RuntimeError; end
+
 	# Transparent reference to a remote object:
 	class RemoteObject
 		for m in instance_methods
@@ -368,8 +386,10 @@ module RO4R
 						ref= make_reference r, forceref
 						send Return.new( msg.tid, ref, false)
 					rescue Exception=> e
-						$stderr.puts "Error in local call: #{e}"
-						$stderr.puts e.backtrace
+						RO4R.logger.debug do
+							"error in remote call '#{msg.nme}': #{e.class}: #{e.message}\n" +
+								Array( e.backtrace).join( "\n")
+						end
 						send_error msg.tid, e
 					end
 					if @pool.size< @poolsize then @pool.push t else Thread.exit end
@@ -455,8 +475,7 @@ module RO4R
 								t[:recv_cond].signal
 							end
 						else
-							$stderr.puts "Thread #{t} not found"
-							# local warinig would be in order, but no action required
+							RO4R.logger.warn "no thread waiting for #{msg.__class} #{msg.tid}"
 						end
 					when Release
 						@local.delete msg.oid
@@ -466,16 +485,23 @@ module RO4R
 				# EOFError / ECONNRESET just mean the peer disconnected; don't
 				# report those, but still run the cleanup below so that threads
 				# waiting on this connection are woken up with the error.
-				$stderr.puts e.inspect unless e.is_a?( EOFError) or e.is_a?( Errno::ECONNRESET)
+				unless e.is_a?( EOFError) or e.is_a?( Errno::ECONNRESET)
+					RO4R.logger.error{ "connection closed: #{e.inspect}"}
+				end
 				Thread.current[:err]= e
+				@closed= true
 				@io.close
-				@recv_mutex.synchronize do
-					rec= @receiver.values.grep Thread
-					rec.each { |t|
-						@receiver[t.__id__]= e;
-						#### t.run if t.alive?
-						t[:recv_cond].signal
-					}
+				# Wake up callers waiting for a reply. Their condition variables are
+				# bound to @send_mutex, so it must be held here or the signal can be
+				# lost between their check and their wait.
+				err= ConnectionError.new "Unable to reach peer (#{e.class}: #{e.message})"
+				@send_mutex.synchronize do
+					@recv_mutex.synchronize do
+						@receiver.values.grep( Thread).each do |t|
+							@receiver[ t.__id__]= err
+							t[:recv_cond].signal
+						end
+					end
 				end
 			ensure
 				#r.puts "listen() exiting"
@@ -490,8 +516,8 @@ module RO4R
 		end
 
 		def send msg, wait= false
-			raise "Unable to reach peer" unless @thread.alive?
-			$stderr.puts "Sending #{msg.__class}" unless msg.__kind_of? Msg
+			raise ConnectionError, "Unable to reach peer" if @closed or not @thread.alive?
+			RO4R.logger.warn "sending a #{msg.__class} instead of a Msg" unless msg.__kind_of? Msg
 			t= Thread.current
 			t[:__conn]= self
 			#data= len= c= tm= nil
@@ -503,7 +529,11 @@ module RO4R
 			@send_mutex.synchronize do
 				c=( t[:recv_cond]||= ConditionVariable.new)
 				#__time 'write' {
-				@io.write [len].pack("L<") << data
+				begin
+					@io.write [len].pack("L<") << data
+				rescue IOError, SystemCallError=> e
+					raise ConnectionError, "Unable to reach peer (#{e.message})"
+				end
 				#@io.write data
 				#}
 				#__time 'wait' {
@@ -616,17 +646,18 @@ module RO4R
 	class Server
 		DefaultPort= 4044
 		DefaultAddress= '0.0.0.0'
-		attr_reader :connections
+		attr_reader :connections, :server # server: the listening socket
 
 		# safe: unused since Ruby 3.0 removed $SAFE; kept for API compatibility.
 		def initialize object= Hash.new, port= DefaultPort, safe= nil
 			### root object must be passed by ref:
 			raise ArgumentError, "#{object} must be sent by reference" unless object.__by_ref?
-			server= case port
+			@server= case port
 			when Integer
 				TCPServer.new DefaultAddress, port
-			when String
+			when String # "port" or "address:port"
 				a, p= *port.split(':')
+				a, p= DefaultAddress, a unless p
 				TCPServer.new a, p.to_i
 			else
 				port # probably an IO
@@ -636,18 +667,41 @@ module RO4R
 			@connections= []
 			@mutex= Mutex.new
 			@thread= Thread.new do
-				while true
-					io= server.accept
-					@mutex.synchronize do
-						@connections << Connection.new( io, object, safe) do |c|
-							@mutex.synchronize{ @connections.delete c}
+				begin
+					while true
+						io= @server.accept
+						@mutex.synchronize do
+							@connections << Connection.new( io, object, safe) do |c|
+								@mutex.synchronize{ @connections.delete c}
+							end
 						end
 					end
+				rescue IOError, SystemCallError # listening socket closed
 				end
 			end
 		end
 
 		def join() @thread.join end
+
+		# Stop accepting connections and disconnect all clients.
+		def close
+			# Wake the accept loop with shutdown and let it exit before closing
+			# the socket: closing it while a thread is blocked in accept makes
+			# Ruby raise IOError in that thread even if accept(2) has just
+			# returned, which leaks the accepted descriptor and leaves that
+			# client hanging with an open, unserved connection.
+			if @server.respond_to? :shutdown
+				@server.shutdown rescue nil
+				@thread.join
+			end
+			@server.close unless @server.closed?
+			@thread.join # no connection can be added after the accept loop ends
+			@mutex.synchronize{ @connections.dup}.each do |c|
+				c.close rescue nil
+				c.thread.join 5 # wait for its listen thread to clean up
+			end
+			nil
+		end
 	end
 
 	# Classes # to be passed by value (serialized):

@@ -4,6 +4,8 @@ Git export of RO4R, a Ruby RPC library that has been in production use since 200
 
 ## Supported Ruby versions
 
+A `.ruby-version` file pins 4.0.6 for rbenv and similar tools.
+
 Supports all Ruby versions from 2.7 up to and including Ruby 4.0, in all combinations of
 client and server versions. (2.7 is required because remote object references are now
 tracked in an `ObjectSpace::WeakMap` keyed by integer ids.)
@@ -75,7 +77,17 @@ The second line are the contents of the shared Hash object. In it you see the :c
 
 ### Testing
 
-To test RO4R, you can create two processes (client and server), and then display and modify variables and invoke remote functions.
+The automated test suite (minitest, bundled with Ruby) runs with:
+
+```
+  ruby -I. test/test_ro4r.rb
+```
+
+It starts a server on an ephemeral port inside the test process and covers
+calls, blocks, exception propagation, the method blocklist, connection
+tracking and shutdown, and reference handling.
+
+To test RO4R manually, you can create two processes (client and server), and then display and modify variables and invoke remote functions.
 
 1. To conveniently test modifying data, run the basic benchmark under IRB, then modify some hash keys on the example shared object `$r`:
 
@@ -134,6 +146,26 @@ Older Benchmarks from 2008:
 ```
 
 ## Programming notes
+
+### Shutting down
+
+`RO4R::Server#close` stops accepting connections, disconnects every client and
+waits for their handler threads to finish. `RO4R::Connection#close` disconnects
+a single client. Calls made on a connection whose peer has gone away raise
+`RO4R::ConnectionError` (a `RuntimeError`, message "Unable to reach peer").
+
+### Logging
+
+By default RO4R prints only warnings and errors to `$stderr`. Exceptions raised
+inside remotely invoked methods are returned to the caller and only logged at
+debug level, i.e. discarded. To see them, or to route messages elsewhere,
+assign any object responding to `debug`, `warn` and `error` (a standard
+`Logger` works) to `RO4R.logger`:
+
+```ruby
+  require 'logger'
+  RO4R.logger= Logger.new( $stdout)
+```
 
 ### Shared classes
 
