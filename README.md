@@ -1,12 +1,39 @@
-# RO4R - Remote Objects for Ruby 2.4+
+# RO4R - Remote Objects for Ruby 2.7+
 
 Git export of RO4R, a Ruby RPC library that has been in production use since 2007.
 
 ## Supported Ruby versions
 
-Supports all Ruby versions from 2.4 above, in all combinations of client and server versions.
+Supports all Ruby versions from 2.7 up to and including Ruby 4.0, in all combinations of
+client and server versions. (2.7 is required because remote object references are now
+tracked in an `ObjectSpace::WeakMap` keyed by integer ids.)
 
 For support on older versions, please see below under "Other Ruby versions".
+
+## Security
+
+RO4R is designed for use between mutually trusting processes on a trusted network.
+It is **not** safe to expose to untrusted peers:
+
+* Messages are deserialized with `Marshal.load`, which can instantiate arbitrary
+  objects from the wire.
+* A peer can call any public method on an exported object, except for a blocklist
+  of obviously dangerous ones (`send`, `instance_eval`, `system`, ... - see
+  `Object::INSECURE_METHODS`) and any method whose name starts with `_`.
+  A blocklist is not a sandbox; if you need stricter control, override
+  `__secure_method?` in your exported classes with an allowlist.
+* The `safe` argument to `Connection.new` and `Server.new` is ignored, since
+  Ruby 3.0 removed `$SAFE`. It is kept only for API compatibility.
+
+## Wire format
+
+Each message is a 32-bit little-endian length prefix followed by the marshalled
+payload; object ids inside references are 64-bit signed little-endian.
+
+**This is incompatible with releases before the Ruby 4.0 update**, which used
+native-endian 32-bit object ids: both peers must run the same generation of RO4R.
+The change removes a silent wraparound of object ids past 2^31 in long-running
+processes, and lets big-endian hosts interoperate.
 
 ## How to see it work
 
@@ -30,11 +57,8 @@ For support on older versions, please see below under "Other Ruby versions".
   ruby -I. examples/cli.rb
 ```
 
-NOTE: when the client program does its job and disconnects, on the server side you will see the following message which you can safely ignore:
-
-```
-#<NoMethodError: undefined method `length' for nil:NilClass>)
-```
+When the client disconnects, the server silently drops the connection and keeps
+serving other clients.
 
 ### Benchmarks explanation
 
@@ -142,8 +166,18 @@ marshaller can't serialize and pass back to the client.
 ### Code stability
 
 RO4R has been in production use with Ruby 1.8, 1.9, and later since 2007.
+Verified on Ruby 4.0 with `ruby -w -W:deprecated` producing no warnings.
+
+Note for users of Ruby 3.1 and later: exceptions raised by a remote method are
+now correctly returned to the caller by value. Previously they leaked through as
+remote references, and re-raising them on the caller side recursed until
+`SystemStackError`. Exceptions that cannot be marshalled (e.g. ones with singleton
+methods) are returned as a `RuntimeError` carrying the original class and message.
 
 ## Other Ruby versions
+
+For Ruby 2.4 to 2.6, use the git revision preceding the Ruby 4.0 update (the one
+still using `ObjectSpace._id2ref`).
 
 For use with lower versions (Ruby 1.8 to Ruby 2.3) , please either use RO4R release 1.0.0
 or edit RO4R.rb to replace "safe= 1" with "safe= 3" and uncomment the line saying

@@ -3,7 +3,6 @@
 # This program is licensed under the terms of BSD license.
 
 require 'socket'
-require 'thread'
 
 MARSHAL= if defined? RMarshal then RMarshal else Marshal end
 #p MARSHAL
@@ -35,7 +34,9 @@ class Object
 	end
 	alias_method :__respond_to?, :respond_to?
 	# Defined in a prepended module rather than directly on Object, since Ruby
-	# warns about redefining Object#respond_to? (possible infinite loop).
+	# warns about redefining Object#respond_to? (possible infinite loop). It is
+	# also prepended to by-value classes that define their own respond_to?
+	# (e.g. Exception), which would otherwise bypass this override.
 	module RespondTo
 		def respond_to? method, priv= false
 			if :_dump== method || :_dump_as== method ## cheat on Marshal.dump
@@ -44,7 +45,7 @@ class Object
 				 # marshal_dump and marshal_load methods exposed by the object
 				__by_ref?
 			else
-				__respond_to? method, priv
+				super
 			end
 		end
 	end
@@ -70,9 +71,20 @@ class Object
 				"undefined or private remote method '#{m}' called" # for #{self.inspect}"
 		end
 	end
+	# Methods that must not be invoked by a remote peer on an exported object.
+	# NOTE: this is a blocklist, not a sandbox; see "Security" in README.md.
+	# Names starting with '_' (e.g. __send__, _dump) are rejected separately.
+	INSECURE_METHODS= [
+		:send, :public_send, :method, :public_method, :singleton_method,
+		:eval, :instance_eval, :instance_exec, :class_eval, :class_exec,
+		:module_eval, :module_exec, :define_method, :define_singleton_method,
+		:instance_variable_get, :instance_variable_set, :remove_instance_variable,
+		:extend, :singleton_class, :system, :exec, :spawn, :fork, :exit, :exit!,
+		:abort, :load, :require, :require_relative, :binding,
+	].freeze
 	def __secure_method? method
-		## intended to be redefined in subclasses e.g. like this:
-		not [ :send].include? method
+		## intended to be redefined in subclasses, e.g. with an allowlist
+		not INSECURE_METHODS.include? method
 	end
 end
 
@@ -117,7 +129,7 @@ module RO4R
 		end
 		def oid() @id end
 		def self._load str
-			id= str.unpack( 'l').first
+			id= str.unpack( 'q<').first
 			Thread.current[:__conn].make_object self.new( id)
 		end
 		def respond_to? method, priv= false
@@ -128,7 +140,7 @@ module RO4R
 			end
 		end
 		def _dump depth
-			[ @id].pack( 'l')
+			[ @id].pack( 'q<')
 		end
 	end
 end
@@ -149,14 +161,17 @@ end
 module RO4R
 	### Connection to a remote machine (server or client) ###
 	class Connection
-		def initialize host='localhost', object= nil, safe= 1
-			@safe= safe.to_i
+		# safe: unused since Ruby 3.0 removed $SAFE; kept for API compatibility.
+		# The optional block is invoked with the connection once it is closed.
+		def initialize host='localhost', object= nil, safe= nil, &on_close
+			@safe= safe
+			@on_close= on_close
 			@send_mutex= Mutex.new
 			@recv_mutex= Mutex.new
 			@recv_cond= ConditionVariable.new
 			@object= object # local object (exported over connection)
 			@receiver= {}
-			@remote= {} # remote_id -> local_id mapping (to reuse RemoteObject)
+			@remote= ObjectSpace::WeakMap.new # remote_id -> RemoteObject (to reuse it)
 			@local= {} # local_id -> local Object (must not disappear while in use remotely)
 			case host
 			when String
@@ -199,20 +214,14 @@ module RO4R
 		def add_remote id
 			### TODO: check whether to allow foreign objects or not
 			ro= RemoteObject.new id, self
-			#$stderr.print "New remote_object with local id: #{ro.__id__} "
-			@remote[ id]= ro.__id__
+			@remote[ id]= ro # weak; the entry disappears when ro is collected
 			ObjectSpace.define_finalizer ro, make_finalizer( id)
-			#$stderr.puts " + defined finalizer."
 			ro
 		end
-		def delete_remote id
-			@remote.delete id
-		end
 		def make_finalizer id
+			# tell the peer that we no longer hold a reference to its object
 			proc{ |lid| Thread.new {
 				begin
-					#$stderr.print "Finalizer for #{lid}"
-					delete_remote id
 					send Release.new( id)
 				rescue
 					# ignore, since the RemoteObject is already gone, anyway.
@@ -225,15 +234,7 @@ module RO4R
 			LID.new object.__id__
 		end
 		def remote_object rid
-			#$stderr.print "remote_object: #{rid} "
-			if @remote.has_key? rid # reuse
-				lid= @remote[ rid]
-				#$stderr.puts "(already seen)"
-				ObjectSpace._id2ref lid
-			else # create
-				#$stderr.puts "(new)"
-				add_remote rid
-			end
+			@remote[ rid] || add_remote( rid) # reuse or create
 		end
 		public
 
@@ -245,7 +246,7 @@ module RO4R
 			#$stderr.puts "make_object: #{reference.inspect}"
 			if reference.kind_of? RID	 # our local object
 				unless has_local? reference.oid  # was that ref ever given?
-					raise TypeError, "No reference given for object id #{@id}"
+					raise TypeError, "No reference given for object id #{reference.oid}"
 				end
 				@local[ reference.oid]
 			else # kind_of LID, we got a remote object
@@ -348,7 +349,7 @@ module RO4R
 						#GC.disable
 						if msg.nme
 							if msg.nme.to_s[0..0]=='_'
-								raise NoMethodErrorError, "Call forbidden"
+								raise NoMethodError, "Call forbidden"
 							end
 							arg= msg.arg
 							blk= if msg.blk
@@ -369,8 +370,7 @@ module RO4R
 					rescue Exception=> e
 						$stderr.puts "Error in local call: #{e}"
 						$stderr.puts e.backtrace
-						#$stderr.puts "@local: #{@local.inspect}"
-						send Return.new( msg.tid, e, true)
+						send_error msg.tid, e
 					end
 					if @pool.size< @poolsize then @pool.push t else Thread.exit end
 				end
@@ -378,6 +378,15 @@ module RO4R
 			Thread.pass until lct.stop?
 			lct[ :msg]= message
 			lct.run if lct.alive?
+		end
+
+		# Return an exception to the caller. If it cannot be marshalled (e.g. it
+		# holds a Proc or an IO), send a plain RuntimeError instead, so that the
+		# remote caller is not left waiting forever.
+		def send_error tid, e
+			send Return.new( tid, e, true)
+		rescue TypeError, ArgumentError
+			send Return.new( tid, RuntimeError.new( "#{e.class}: #{e.message}"), true)
 		end
 
 		def __time( label='', res=nil)
@@ -394,8 +403,6 @@ module RO4R
 		def listen
 			Thread.current[:__conn]= self
 			@io.binmode
-#			@io.nonblock= true
-			$SAFE= @safe
 			begin
 				len= data= msg= nil
 				while true
@@ -412,7 +419,7 @@ module RO4R
 						data<< aux
 					end
 					#GC.disable
-					len= data.unpack("L").first
+					len= data.unpack("L<").first
 					#GC.enable
 					#}
 					#__time 'sel2', 'OK' {
@@ -473,11 +480,12 @@ module RO4R
 			ensure
 				#r.puts "listen() exiting"
 				# purge finalizers
-				@remote.each_value do |id|
-					ObjectSpace.undefine_finalizer ObjectSpace._id2ref( id)
+				@remote.each_value do |ro|
+					ObjectSpace.undefine_finalizer ro
 				end
-				@remote.clear # useless after the connection is broken
+				@remote= ObjectSpace::WeakMap.new # useless after the connection is broken
 				@local.clear # free local objects
+				@on_close.call self if @on_close
 			end
 		end
 
@@ -495,7 +503,7 @@ module RO4R
 			@send_mutex.synchronize do
 				c=( t[:recv_cond]||= ConditionVariable.new)
 				#__time 'write' {
-				@io.write [len].pack("L") << data
+				@io.write [len].pack("L<") << data
 				#@io.write data
 				#}
 				#__time 'wait' {
@@ -610,7 +618,8 @@ module RO4R
 		DefaultAddress= '0.0.0.0'
 		attr_reader :connections
 
-		def initialize object= Hash.new, port= DefaultPort, safe= 1
+		# safe: unused since Ruby 3.0 removed $SAFE; kept for API compatibility.
+		def initialize object= Hash.new, port= DefaultPort, safe= nil
 			### root object must be passed by ref:
 			raise ArgumentError, "#{object} must be sent by reference" unless object.__by_ref?
 			server= case port
@@ -622,10 +631,19 @@ module RO4R
 			else
 				port # probably an IO
 			end
-			# Automatically accept incoming connections
+			# Automatically accept incoming connections; a connection removes
+			# itself from the list once its peer disconnects.
 			@connections= []
+			@mutex= Mutex.new
 			@thread= Thread.new do
-				@connections << Connection.new( server.accept, object, safe) while true
+				while true
+					io= server.accept
+					@mutex.synchronize do
+						@connections << Connection.new( io, object, safe) do |c|
+							@mutex.synchronize{ @connections.delete c}
+						end
+					end
+				end
 			end
 		end
 
@@ -643,9 +661,19 @@ module RO4R
 		NilClass,	Numeric,
 		Range, Regexp,
 		String, Symbol,
-		Time, TrueClass
-	].each do |c|
+		Time, TrueClass,
+		# Exception backtraces are held in a Thread::Backtrace object, which
+		# Marshal converts to an Array via a compat hook. That hook is only
+		# reached if Object#_dump does not claim the object, so it must be
+		# by-value or exceptions cannot be returned to the caller.
+		(Thread::Backtrace if defined? Thread::Backtrace),
+	].compact.each do |c|
 		c.class_eval{ extend ByVal; include ByVal}
+		# Exception defines its own respond_to?, which would hide the override
+		# in Object::RespondTo and make exceptions travel by reference:
+		unless c.instance_method( :respond_to?).owner== Object::RespondTo
+			c.prepend Object::RespondTo
+		end
 	end
 	# Objects # to be passed by value (serialized):
 	[	Binding,
