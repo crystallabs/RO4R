@@ -174,8 +174,15 @@ module RO4R
 		end
 		# [positional args, keywords Hash or nil]
 		def self.unpack args
-			if args.last.__kind_of?( self)
-				[ args[ 0...-1], args.last.to_h]
+			last= args.last
+			if last.__kind_of?( self)
+				[ args[ 0...-1], last.to_h]
+			elsif last.__kind_of?( RemoteObject)
+				# Ruby 2.7 takes a trailing argument as keywords if the method
+				# accepts them, probing it with to_hash: on a RemoteObject that
+				# is a remote call, and what comes back is another RemoteObject,
+				# never a Hash. Passing empty keywords keeps it positional.
+				[ args, {}]
 			else
 				[ args, nil]
 			end
