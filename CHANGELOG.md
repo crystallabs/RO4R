@@ -1,6 +1,14 @@
 # Changelog
 
-## 3.0.0 (unreleased)
+## 3.0.1
+
+### Fixed
+
+* `Server#close` hung on macOS (and the BSDs), where `shutdown` does not wake
+  a thread blocked in `accept` on a listening socket. The accept loop is now
+  woken through a pipe.
+
+## 3.0.0
 
 Requires Ruby 2.7 or later. The wire format is incompatible with 1.x; both
 peers must run 3.x. (The v2.0.0 tag from 2018 predates all of this; the

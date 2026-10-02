@@ -949,10 +949,15 @@ module RO4R
 			# itself from the list once its peer disconnects.
 			@connections= []
 			@mutex= Mutex.new
+			# Closing this pipe wakes the accept loop (see #close).
+			@stop_r, @stop_w= IO.pipe
 			@thread= Thread.new do
 				begin
 					while true
-						io= @server.accept
+						ready,= IO.select [ @server, @stop_r]
+						break if ready.include? @stop_r
+						io= @server.accept_nonblock exception: false
+						next if io== :wait_readable
 						@mutex.synchronize do
 							@connections << Connection.new( io, object, safe, **options) do |c|
 								@mutex.synchronize{ @connections.delete c}
@@ -969,17 +974,17 @@ module RO4R
 
 		# Stop accepting connections and disconnect all clients.
 		def close
-			# Wake the accept loop with shutdown and let it exit before closing
-			# the socket: closing it while a thread is blocked in accept makes
-			# Ruby raise IOError in that thread even if accept(2) has just
-			# returned, which leaks the accepted descriptor and leaves that
-			# client hanging with an open, unserved connection.
-			if @server.respond_to? :shutdown
-				@server.shutdown rescue nil
-				@thread.join
-			end
-			@server.close unless @server.closed?
+			# Wake the accept loop and let it exit before closing the socket:
+			# closing it while a thread is blocked in accept makes Ruby raise
+			# IOError in that thread even if accept(2) has just returned, which
+			# leaks the accepted descriptor and leaves that client hanging with
+			# an open, unserved connection. The loop is woken through a pipe
+			# since shutdown does not wake accept on a listening socket on
+			# every platform (it fails with ENOTCONN on macOS and the BSDs).
+			@stop_w.close unless @stop_w.closed?
 			@thread.join # no connection can be added after the accept loop ends
+			@server.close unless @server.closed?
+			@stop_r.close unless @stop_r.closed?
 			@mutex.synchronize{ @connections.dup}.each do |c|
 				c.close rescue nil
 				c.thread.join 5 # wait for its listen thread to clean up
