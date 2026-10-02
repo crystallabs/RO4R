@@ -1,15 +1,31 @@
-# Runs on a v* tag push: tests and checks that the tag matches RO4R::VERSION.
+# Runs on a v* tag push: tests, checks that the tag matches RO4R::VERSION,
+# and attaches the built gem to the tag's GitHub release.
 name: Release
 
 on:
   push:
     tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach the gem to (empty builds the current ref without attaching)
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  GH_TOKEN: ${{ github.token }}
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG || github.ref }}
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.4'
@@ -17,6 +33,30 @@ jobs:
       - name: Test
         run: bundle exec rake test
       - name: Check the tag matches the gem version
+        if: env.TAG != ''
         run: |
           v=$(ruby -Ilib -r ro4r/version -e 'print RO4R::VERSION')
-          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != v$v"; exit 1; }
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG != v$v"; exit 1; }
+      # The gem is pure Ruby, so one build serves every platform.
+      - name: Build gem
+        id: gem
+        run: |
+          gem build ro4r.gemspec
+          gem=$(ls ro4r-*.gem)
+          shasum -a 256 "$gem" > "$gem.sha256"
+          echo "name=$gem" >> "$GITHUB_OUTPUT"
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.gem.outputs.name }}
+          path: |
+            ${{ steps.gem.outputs.name }}
+            ${{ steps.gem.outputs.name }}.sha256
+          if-no-files-found: error
+      - name: Attach to release
+        if: env.TAG != ''
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --generate-notes
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "${{ steps.gem.outputs.name }}" "${{ steps.gem.outputs.name }}.sha256"
