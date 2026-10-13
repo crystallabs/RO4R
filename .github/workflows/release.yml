@@ -1,10 +1,13 @@
-# Runs on a v* tag push: tests, checks that the tag matches RO4R::VERSION,
-# and attaches the built gem to the tag's GitHub release.
+# Runs on a v* tag push: tests, checks that the tag matches RO4R::VERSION and
+# builds the gem, keeping it as a workflow artifact; it creates no release.
+# Publishing the tag's GitHub release runs it again, attaching the gem.
 name: Release
 
 on:
   push:
     tags: [ 'v*' ]
+  release:
+    types: [ published ]
   workflow_dispatch:
     inputs:
       tag:
@@ -17,6 +20,9 @@ permissions:
 
 env:
   TAG: ${{ inputs.tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  # Attach to the release only when there is one: a published release, or a
+  # hand run naming a tag. A tag push only builds, creating no release.
+  ATTACH: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.tag != '') }}
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -54,9 +60,7 @@ jobs:
             ${{ steps.gem.outputs.name }}.sha256
           if-no-files-found: error
       - name: Attach to release
-        if: env.TAG != ''
+        if: env.ATTACH == 'true'
         run: |
-          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --verify-tag --generate-notes
           gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
             "${{ steps.gem.outputs.name }}" "${{ steps.gem.outputs.name }}.sha256"
