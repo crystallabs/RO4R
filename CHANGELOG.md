@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+* A block whose result could not be sent back (larger than `max_frame`, or
+  not marshallable) left the remote method suspended in its `yield` forever,
+  holding a worker thread. The `yield` now raises `RO4R::ProtocolError`.
+* A failed `accept` (`ECONNABORTED` when a peer reset the connection before it
+  was accepted, `EMFILE`, ...) silently ended the server's accept loop; later
+  clients connected but were never served. The failure is now logged and the
+  server keeps accepting.
+* README: classes you define are passed by reference, not by name; only the
+  class objects of the by-value classes and a few others are.
+
+## 3.0.2
+
+* Release workflow: the gem is attached to the GitHub release.
+
 ## 3.0.1
 
 ### Fixed

@@ -552,7 +552,17 @@ module RO4R
 					@receiver[ id]= q
 				end
 				begin
-					transmit msg
+					begin
+						transmit msg
+					rescue ProtocolError, TypeError, ArgumentError=> e
+						# Our own call cannot be sent: tell the caller. The result
+						# of our block cannot be sent (too large, unmarshallable):
+						# fail the peer's yield with the reason instead of leaving
+						# it waiting forever, and keep waiting for its reply.
+						raise unless msg.__kind_of? Return
+						transmit Return.new( msg.tid,
+							ProtocolError.new( "block result cannot be sent: #{e.message}"), true)
+					end
 					msg= pop q, timeout
 				ensure
 					@recv_mutex.synchronize{ @receiver.delete id}
@@ -956,7 +966,15 @@ module RO4R
 					while true
 						ready,= IO.select [ @server, @stop_r]
 						break if ready.include? @stop_r
-						io= @server.accept_nonblock exception: false
+						begin
+							io= @server.accept_nonblock exception: false
+						rescue SystemCallError=> e
+							# ECONNABORTED (peer reset before accept), EMFILE...:
+							# one failed accept must not stop the server
+							RO4R.logger.warn "accept failed: #{e.message}"
+							sleep 0.1 # don't spin if the condition persists (EMFILE)
+							next
+						end
 						next if io== :wait_readable
 						@mutex.synchronize do
 							@connections << Connection.new( io, object, safe, **options) do |c|

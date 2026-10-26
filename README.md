@@ -58,6 +58,10 @@ It is **not** safe to expose to untrusted peers:
   A blocklist is not a sandbox; if you need stricter control, pass an allowlist
   to the server (see "Restricting methods" below) or override `__secure_method?`
   in your exported classes.
+* Classes you define are passed by reference (see "Passing objects" below), and
+  `class` is a public method of every exported object. Through such a class
+  proxy a peer can reach `superclass`, `const_get` and `new`, i.e. every
+  constant and class loaded in the process, not only the exported object.
 * A peer can make the receiver create as many worker threads as it has calls
   in flight, and can send messages up to `max_frame` bytes (256 MiB unless
   configured otherwise).
@@ -300,12 +304,19 @@ remote method's `yield` raises `RO4R::BlockExit`, which is an `Exception` but
 not a `StandardError`: `rescue => e` does not catch it, `ensure` blocks run,
 and the method unwinds instead of waiting forever for a block result that will
 never come. Nothing is sent back to the caller in that case, since it is gone.
+If the block's result cannot be sent (it is larger than `max_frame`, or cannot
+be marshalled), the remote method's `yield` raises `RO4R::ProtocolError`
+instead, and the caller gets whatever the method then returns or raises.
 
 ### Passing objects: by reference or by value
 
 Objects are passed by reference unless their class is by value. By value are
 `Array`, `String`, `Symbol`, `Integer`, `Float`, `Range`, `Regexp`, `Time`,
-`Exception`, `nil`, `true` and `false`; classes and modules are passed by name.
+`Exception`, `nil`, `true` and `false`. The class objects of the by-value
+classes, of `Hash`, `IO`, `Struct`, `Proc`, `Thread` and a few others, and of
+their subclasses, are passed by name (`Class`, `Module` and `Kernel` too). Any
+other class, including every class you define, is passed by reference like an
+ordinary object, so the peer can call `new` on it.
 Everything else, **including `Hash`**, is passed by reference: the receiver
 gets a `RO4R::RemoteObject` proxy and every method call on it goes back to the
 owner. To pass your own class by value, `include ByVal` in it (and give it

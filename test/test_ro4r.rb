@@ -249,6 +249,30 @@ class TestRO4R< Minitest::Test
 		wait_until{ @server.connections.size== 1}
 	end
 
+	# A listening socket whose first accept fails, as accept(2) does with
+	# ECONNABORTED when the peer resets before being accepted, or EMFILE.
+	class FlakyListener< TCPServer
+		def accept_nonblock( **opts)
+			unless @failed
+				@failed= true
+				raise Errno::ECONNABORTED
+			end
+			super
+		end
+	end
+	def test_accept_loop_survives_a_failed_accept
+		l= FlakyListener.new '127.0.0.1', 0
+		s= RO4R::Server.new Exported.new, l
+		c= RO4R::Connection.new "127.0.0.1:#{l.addr[1]}", timeout: 5
+		assert_equal 42, c.root.ok # the connection the failed accept concerned
+		c.close
+		c= RO4R::Connection.new "127.0.0.1:#{l.addr[1]}", timeout: 5
+		assert_equal 42, c.root.ok # and the server still accepts after it
+		c.close
+		assert RO4R.logger.lines.any?{ |level, msg| level== :warn && msg.include?( "accept failed") }
+		s.close
+	end
+
 	def test_server_close_stops_accepting
 		@server.close
 		assert_raises( Errno::ECONNREFUSED) { connect }
@@ -424,6 +448,25 @@ class TestRO4R< Minitest::Test
 		bogus= RO4R::RemoteObject.new 123456, @conn
 		e= assert_raises( RO4R::ProtocolError) { @r.echo [ bogus]}
 		assert_includes e.message, "123456"
+		assert_equal 42, @r.ok
+	end
+
+	def test_unsendable_block_result_unwinds_the_server_method
+		# Our block's result cannot be sent: the server's yield must raise, not
+		# wait forever for a result that never comes.
+		c= connect max_frame: 4000
+		e= assert_raises( RO4R::ProtocolError) { c.root.yield_once{ 'x'* 10_000 } }
+		assert_includes e.message, "block result cannot be sent"
+		assert_includes e.message, "max_frame"
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes # not :completed
+		assert_equal 42, c.root.ok
+		c.close
+		e= assert_raises( RO4R::ProtocolError) { @r.yield_once{ Struct.new( :a) } } # unmarshallable
+		assert_includes e.message, "block result cannot be sent"
+		wait_until{ $outcomes.size>= 2}
+		assert_equal [ :yielding, :ensure], outcomes
+		wait_until{ ro4r_threads.none?{ |t| t.backtrace.any?{ |l| l.include? 'remote_yield'} } }
 		assert_equal 42, @r.ok
 	end
 
