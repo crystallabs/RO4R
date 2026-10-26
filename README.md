@@ -74,25 +74,45 @@ It is **not** safe to expose to untrusted peers:
 
 ## Wire format
 
-Each message is a 13-byte header followed by the marshalled payload. The header
-holds the payload length (32-bit unsigned), the message kind (one byte: 1 call,
-2 return, 3 yield, 4 release) and the id of the call the message concerns
-(64-bit signed): the sender's call id for a call or yield, the receiver's for a
-return. All fields are little-endian. The header lets a receiver that cannot
-decode a payload (an object of a class it does not define, a frame larger than
-`max_frame`) answer that one call with an error instead of dropping the
-connection.
+Each side starts by writing a 10-byte handshake: the magic `RO4R`, the protocol
+version (`RO4R::PROTOCOL_VERSION`, 16-bit) and its own `max_frame` (32-bit, 0
+for none). A peer that sends anything else, or another version, is refused
+with a `ConnectionError` naming the reason. Once a side has read the handshake
+it also refuses, locally, to send a message larger than the peer accepts.
 
-Messages are marshalled as arrays of their fields (`marshal_dump`), and object
-ids inside references are 64-bit signed little-endian. Each side's root object
-has id 0. A `Release` message carries the number of references being released.
+Each message is then a 13-byte header followed by the payload. The header holds
+the payload length (32-bit unsigned), the message kind (one byte: 1 call, 2
+return, 3 yield, 4 release, 5 call returning by reference) and the id of the
+call the message concerns (64-bit signed): the sender's call id for a call or
+yield, the receiver's for a return. All fields are little-endian. The header
+lets a receiver that cannot decode a payload (an object of a class it does not
+define, a frame larger than `max_frame`) answer that one call with an error
+instead of dropping the connection.
+
+The payload is the `Marshal` dump of a plain Array of the message's remaining
+fields, interpreted according to the header's kind, so that neither class nor
+instance variable names travel:
+
+* call: `[object id, method name, positional args, keyword pairs or nil, block given?]`
+* return: `[value or exception, exception?]`
+* yield: `[id of the call being served, args, keyword pairs or nil]`
+* release: `[object id, count, object id, count, ...]`; releases that are
+  queued together are sent as one message
+
+Object ids inside references (`LID` for an object of the sender, `RID` for one
+of the receiver) are per-connection counters encoded as BER-compressed integers
+(`pack 'w'`: one byte below 128, two below 16384). Each side's root object has
+id 0. A call of a method with one small argument is 28 bytes on the wire, its
+return of a small value 20, and a reference 8.
 Sockets are set to `TCP_NODELAY` and `SO_KEEPALIVE`. `Connection#read(io,
 maxlen)` is the single point through which bytes enter and may be overridden;
 it must return between 1 and `maxlen` bytes or raise `EOFError`.
 
-**Both peers must run the same generation of RO4R.** The 3.0 format is
-incompatible with earlier releases (which had wider messages, native-endian
-32-bit ids, and a root id that differed between 32- and 64-bit hosts).
+**Both peers must speak the same protocol version.** 3.0 (no handshake, class
+names in payloads, fixed 64-bit ids) and the releases before it (4-byte
+native-endian header, native 32-bit ids, host-dependent root id) are
+incompatible with this format; the handshake is what makes the mismatch a
+clear error from now on.
 
 ## How to see it work
 
@@ -232,6 +252,8 @@ connection it accepts:
 * `poolsize:` idle worker threads kept per connection (default 5).
 * `logger:` a logger for this connection (default: `RO4R.logger`).
 * `max_frame:` largest message, in bytes, sent or accepted (default 256 MiB).
+  Each side announces it in the handshake, so a message too large for the peer
+  is refused before it is sent.
 * `allow:` an allowlist of methods, see "Restricting methods".
 * `on_close:` a callable invoked with the connection once it is closed.
 
@@ -258,7 +280,8 @@ Calls to other methods raise `SecurityError` on the caller's side. The blocklist
 waits for their handler threads to finish. `RO4R::Connection#close` disconnects
 a single client. Calls made on a connection whose peer has gone away, and calls
 that were waiting for a reply when it went away, raise `RO4R::ConnectionError`
-(a `RuntimeError`, message "Unable to reach peer").
+(a `RuntimeError`, message "Unable to reach peer" followed by the reason the
+connection closed, in parentheses).
 
 ### Errors
 
@@ -389,6 +412,16 @@ now correctly returned to the caller by value. Previously they leaked through as
 remote references, and re-raising them on the caller side recursed until
 `SystemStackError`. Exceptions that cannot be marshalled (e.g. ones with singleton
 methods) are returned as a `RuntimeError` carrying the original class and message.
+
+## Changes in 3.1
+
+The wire format changed again (see "Wire format"), and 3.1 peers refuse 3.0
+peers with a clear error instead of hanging: connections open with a handshake
+carrying a protocol version and the sender's `max_frame`; payloads carry no
+class or instance variable names; reference ids are small per-connection
+counters; releases are batched. A typical call is a third smaller than in
+3.0. `Connection#call` now requires a `RemoteObject`, and `ConnectionError`
+messages say why the connection closed. See CHANGELOG.md.
 
 ## Changes in 3.0
 

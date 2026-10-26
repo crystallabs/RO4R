@@ -21,6 +21,7 @@ class Exported
 	def each_kw() yield x: 1 end
 	def obj() Object.new end
 	def shared() @shared||= Exported.new end
+	def me() self end
 	def echo( x) x end
 	def epoch() Time.at( 0).utc end
 	def kw( a:, b: 2) [ a, b] end
@@ -376,11 +377,111 @@ class TestRO4R< Minitest::Test
 	end
 
 	def test_messages_are_marshalled_compactly
-		data= Marshal.dump RO4R::Call.new( 1, 2, :m, [ 3], false)
-		refute_includes data, "@tid"
-		msg= Marshal.load data
-		assert_equal [ 1, 2, :m, [ 3], false], [ msg.tid, msg.oid, msg.nme, msg.arg, msg.blk]
-		assert_operator data.bytesize, :<, 40
+		# payloads are plain Arrays dispatched on the header's kind: no class
+		# names, no instance variable names, no call id
+		msg= RO4R::Call.new( 1, 2, :m, [ 3], false)
+		data= Marshal.dump msg.payload
+		refute_includes data, "RO4R"
+		refute_includes data, "@"
+		assert_operator data.bytesize, :<, 20
+		back= RO4R::Msg.decode msg.kind, msg.hid, Marshal.load( data)
+		assert_instance_of RO4R::Call, back
+		assert_equal [ 1, 2, :m, [ 3], false], [ back.tid, back.oid, back.nme, back.arg, back.blk]
+		assert_instance_of RO4R::RefCall, RO4R::Msg.decode( RO4R::Msg::REFCALL, 1, msg.payload)
+		# keywords are a field of the record, not a Kwargs object on the wire
+		msg= RO4R::Call.new( 1, 2, :m, [ 3, RO4R::Kwargs.new( a: 1)], false)
+		data= Marshal.dump msg.payload
+		refute_includes data, "Kwargs"
+		back= RO4R::Msg.decode msg.kind, msg.hid, Marshal.load( data)
+		assert_equal [[ 3], { a: 1}], RO4R::Kwargs.unpack( back.arg)
+		y= RO4R::Yield.new 7, 9, [ RO4R::Kwargs.new( x: 1)]
+		back= RO4R::Msg.decode y.kind, y.hid, Marshal.load( Marshal.dump( y.payload))
+		assert_equal [ 7, 9, [[], { x: 1}]], [ back.tid, back.yid, RO4R::Kwargs.unpack( back.arg)]
+		assert_operator Marshal.dump( RO4R::Return.new( 5, 42, false).payload).bytesize, :<, 10
+		assert_operator Marshal.dump( LID.new( 5)).bytesize, :<=, 10 # varint id
+	end
+
+	def test_malformed_payloads_are_rejected
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode 99, 1, []}
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode RO4R::Msg::CALL, 1, "x"}
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode RO4R::Msg::CALL, 1, [ 0, :m]}
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode RO4R::Msg::CALL, 1, [ 0, :m, 3, nil, false]} # args not an Array
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode RO4R::Msg::RELEASE, 0, [ 1]}
+		assert_raises( RO4R::ProtocolError) { RO4R::Msg.decode RO4R::Msg::RELEASE, 0, [ 1, "x"]}
+	end
+
+	def test_releases_merge
+		r= RO4R::Release.new( 5, 2).merge( RO4R::Release.new( 6))
+		assert_equal [ 5, 2, 6, 1], r.payload
+		back= RO4R::Msg.decode r.kind, r.hid, Marshal.load( Marshal.dump( r.payload))
+		assert_equal [[ 5, 2], [ 6, 1]], back.pairs
+		assert_operator Marshal.dump( r.payload).bytesize, :<=, 12
+	end
+
+	def test_releases_queued_together_are_sent_as_one_message
+		sent= []
+		@conn.define_singleton_method( :transmit) do |msg|
+			sent<< msg if msg.__kind_of? RO4R::Release
+			super( msg)
+		end
+		outbox= @conn.instance_variable_get :@outbox
+		100.times{ |i| outbox.push RO4R::Release.new( 100_000+ i) } # ids the server never gave out
+		wait_until{ sent.sum( &:size)== 100}
+		assert_operator sent.size, :<, 100, "releases were not merged"
+		assert_equal 42, @r.ok
+	end
+
+	def test_exported_ids_are_per_connection_counters
+		assert_same @r, @r.me # the root object comes back as the root proxy
+		o= @r.obj
+		assert_operator o.__remote_id, :<, 1000 # a counter, not an object id
+		o2= @r.obj
+		assert_equal o.__remote_id+ 1, o2.__remote_id
+		assert_equal o2.__remote_id, @r.echo( o2).__remote_id # the same object keeps its id
+		assert_raises( ArgumentError) { @conn.call Object.new, :ok } # only remote objects can be called
+	end
+
+	def test_nil_is_recognized_locally
+		assert nil.__nil?
+		refute Object.new.__nil?
+		refute @r.__nil? # a proxy answers locally, no remote call
+	end
+
+	### Handshake ###
+
+	def test_handshake_rejects_other_protocols
+		# a 3.0 frame (13-byte header, no handshake) or anything else is refused
+		[ [ "\x1d\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00", "handshake"],
+			[ [ 'RO4R', 99, 0].pack( RO4R::Connection::HELLO), "protocol 99"] ].each do |bytes, expected|
+			l= TCPServer.new '127.0.0.1', 0
+			t= Thread.new{ s= l.accept; s.write bytes; sleep 2; s.close }
+			c= RO4R::Connection.new "127.0.0.1:#{l.addr[1]}"
+			e= assert_raises( RO4R::ConnectionError) { c.root.ok }
+			assert_includes e.message, expected
+			c.close
+			t.kill
+			l.close
+		end
+		# and the server refuses such a client
+		s= TCPSocket.new '127.0.0.1', @port
+		s.write "GET / HTTP/1.0\r\n\r\n"
+		data= s.read # the server's handshake, then EOF
+		assert_equal RO4R::Connection::MAGIC, data[ 0, 4]
+		assert_equal RO4R::Connection::HELLO_SIZE, data.bytesize
+		s.close
+		wait_until{ RO4R.logger.lines.any?{ |level, msg| level== :error && msg.include?( "handshake") } }
+		assert_equal 42, @r.ok # other connections are unaffected
+	end
+
+	def test_peer_max_frame_is_learned_from_the_handshake
+		s= RO4R::Server.new Exported.new, 0, max_frame: 200
+		c= RO4R::Connection.new "127.0.0.1:#{s.server.addr[1]}"
+		assert_equal 42, c.root.ok # the reply came after the server's handshake
+		e= assert_raises( RO4R::ProtocolError) { c.root.echo 'x'* 1000 } # refused locally
+		assert_includes e.message, "the peer's max_frame (200 bytes)"
+		assert_equal 42, c.root.ok
+		c.close
+		s.close
 	end
 
 	def test_reference_ids_are_64_bit
@@ -621,6 +722,7 @@ class TestRO4R< Minitest::Test
 		assert_equal [ RO4R::Msg::RETURN, 7], [ RO4R::Return.new( 7, nil, false).kind, RO4R::Return.new( 7, nil, false).hid]
 		assert_equal [ RO4R::Msg::YIELD, 9], [ RO4R::Yield.new( 7, 9, []).kind, RO4R::Yield.new( 7, 9, []).hid]
 		assert_equal [ RO4R::Msg::RELEASE, 0], [ RO4R::Release.new( 5).kind, RO4R::Release.new( 5).hid]
+		assert_equal [ RO4R::Msg::REFCALL, 7], [ RO4R::RefCall.new( 7, 0, :m, [], false).kind, RO4R::RefCall.new( 7, 0, :m, [], false).hid]
 	end
 
 	def test_cyclic_arrays_still_travel

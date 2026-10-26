@@ -1,8 +1,42 @@
 # Changelog
 
-## Unreleased
+## 3.1.0
+
+Protocol version 1: the wire format is incompatible with 3.0, and both peers
+must run this release or later.
+
+### Changed
+
+* Each connection opens with a 10-byte handshake (magic, protocol version,
+  the sender's `max_frame`). A peer that sends anything else, or another
+  version, is refused with a `ConnectionError` naming the reason; 3.0 peers
+  used to hang or drop the connection silently. Once the handshake is read, a
+  message larger than the peer accepts is refused locally.
+* Payloads are plain Arrays dispatched on the header's kind byte: no class or
+  instance variable names, and no call id repeated from the header. Keyword
+  arguments are a field of the call or yield record instead of a `Kwargs`
+  object. A call returning by reference is its own kind (5).
+* Exported objects get per-connection sequential ids, encoded as
+  BER-compressed integers, instead of 64-bit object ids. A reference is 8
+  bytes instead of 15.
+* Releases queued together (a GC run collecting many proxies) are sent as one
+  message, up to 1000 at a time.
+* A call with one small argument is 28 bytes on the wire instead of 42, its
+  return 20 instead of 37.
+* `Connection#call` requires a `RemoteObject` of that connection. Passing a
+  local object used to send its object id, which meant nothing to the peer.
+* `ConnectionError` messages say why the connection closed.
+* A method returning its own root object yields the caller's root proxy, not
+  a second proxy for the same object.
 
 ### Fixed
+
+* `nil.__nil?` was false (the alias pointed at `Kernel#nil?`, which `NilClass`
+  overrides), so a connection exporting no object did not report "No root
+  object exported" and a by-reference request for `nil` was honoured.
+* An error while setting up an accepted connection (now including a client
+  that vanished before the handshake was written) ended the server's accept
+  loop.
 
 * A block whose result could not be sent back (larger than `max_frame`, or
   not marshallable) left the remote method suspended in its `yield` forever,
